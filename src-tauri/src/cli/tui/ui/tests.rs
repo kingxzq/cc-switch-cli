@@ -1442,6 +1442,46 @@ fn editor_key_bar_shows_ctrl_o_external_editor_hint() {
 }
 
 #[test]
+fn common_snippet_editor_key_bar_shows_format_and_extract_hints() {
+    let _lock = lock_env();
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::Providers;
+    app.focus = Focus::Content;
+    app.open_editor(
+        "Common Snippet",
+        EditorKind::Json,
+        r#"{"env":{"COMMON_FLAG":"1"}}"#,
+        EditorSubmit::ConfigCommonSnippet {
+            app_type: app.app_type.clone(),
+            source: crate::cli::tui::app::CommonSnippetViewSource::ProviderForm,
+        },
+    );
+
+    let data = minimal_data(&app.app_type);
+    let buf = render(&app, &data);
+    let all = all_text(&buf);
+
+    assert!(
+        all.contains("F2"),
+        "editor should show format shortcut: {all}"
+    );
+    assert!(
+        all.contains("format"),
+        "editor should show format label: {all}"
+    );
+    assert!(
+        all.contains("F4"),
+        "editor should show extract shortcut: {all}"
+    );
+    assert!(
+        all.contains("extract"),
+        "editor should show extract label: {all}"
+    );
+}
+
+#[test]
 fn prompt_form_content_key_bar_shows_ctrl_o_external_editor_hint() {
     let _lock = lock_env();
     let _no_color = EnvGuard::remove("NO_COLOR");

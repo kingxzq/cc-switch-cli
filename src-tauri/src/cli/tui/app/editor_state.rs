@@ -4,6 +4,7 @@ use super::*;
 pub enum EditorKind {
     Plain,
     Json,
+    Toml,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -47,9 +47,12 @@ impl App {
                     return Action::None;
                 };
                 if matches!(item, ConfigItem::CommonSnippet) {
-                    self.overlay = Overlay::CommonSnippetPicker {
-                        selected: snippet_picker_index_for_app_type(&self.app_type),
-                    };
+                    self.open_common_snippet_editor(
+                        self.app_type.clone(),
+                        data,
+                        None,
+                        CommonSnippetViewSource::Global,
+                    );
                 }
                 Action::None
             }
@@ -115,9 +118,12 @@ impl App {
                     }
                     ConfigItem::Validate => Action::ConfigValidate,
                     ConfigItem::CommonSnippet => {
-                        self.overlay = Overlay::CommonSnippetPicker {
-                            selected: snippet_picker_index_for_app_type(&self.app_type),
-                        };
+                        self.open_common_snippet_editor(
+                            self.app_type.clone(),
+                            data,
+                            None,
+                            CommonSnippetViewSource::Global,
+                        );
                         Action::None
                     }
                     ConfigItem::Proxy => Action::ConfigOpenProxyHelp,
@@ -1089,7 +1095,7 @@ impl App {
         });
 
         let kind = if matches!(app_type, AppType::Codex) {
-            EditorKind::Plain
+            EditorKind::Toml
         } else {
             EditorKind::Json
         };

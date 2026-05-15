@@ -631,6 +631,10 @@ pub mod texts {
         "JSON"
     }
 
+    pub fn tui_editor_toml_field_title() -> &'static str {
+        "TOML"
+    }
+
     pub fn tui_editor_hint_view() -> &'static str {
         if is_chinese() {
             "Enter 编辑  ↑↓ 滚动  Ctrl+S 保存  Esc 返回"
@@ -2539,6 +2543,14 @@ pub mod texts {
             "提取"
         } else {
             "extract"
+        }
+    }
+
+    pub fn tui_key_format() -> &'static str {
+        if is_chinese() {
+            "格式化"
+        } else {
+            "format"
         }
     }
 
@@ -8501,6 +8513,14 @@ pub mod texts {
         }
     }
 
+    pub fn common_config_snippet_formatted() -> &'static str {
+        if is_chinese() {
+            "已格式化通用配置片段"
+        } else {
+            "Formatted common config snippet"
+        }
+    }
+
     pub fn common_config_snippet_extract_empty() -> &'static str {
         if is_chinese() {
             "当前编辑内容没有可提取的通用配置"
@@ -8522,13 +8542,13 @@ pub mod texts {
             format!(
                 "通用配置适合保存多个 {app} 供应商共享的插件、环境变量和工具配置。\
                  \n\n有可用片段时，新建供应商会默认勾选“添加通用配置”。\
-                 \n\n如果在当前表单里新增了插件、hooks 或环境变量，可以在“通用配置”里按 A 从当前编辑内容提取并保存片段。"
+                 \n\n如果在当前表单里新增了插件、hooks 或环境变量，可以在“通用配置”编辑器里按 F4 从当前编辑内容提取，再按 Ctrl+S 保存片段。"
             )
         } else {
             format!(
                 "Common Config is for plugin, environment, and tool settings shared by multiple {app} providers.\
                  \n\nWhen a usable snippet exists, new providers will default to attaching it.\
-                 \n\nAfter adding plugins, hooks, or environment variables in this form, open Common Config and press A to extract a snippet from the current edits."
+                 \n\nAfter adding plugins, hooks, or environment variables in this form, open Common Config, press F4 to extract from the current edits, then press Ctrl+S to save the snippet."
             )
         }
     }

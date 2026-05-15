@@ -189,6 +189,12 @@ pub enum Action {
     },
     EditorDiscard,
     EditorOpenExternal,
+    EditorFormatCommonSnippet {
+        app_type: AppType,
+    },
+    EditorExtractCommonSnippet {
+        app_type: AppType,
+    },
 
     SetSkipClaudeOnboarding {
         enabled: bool,

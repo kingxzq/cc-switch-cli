@@ -206,6 +206,12 @@ pub(crate) fn handle_action(
             Ok(())
         }
         Action::EditorOpenExternal => editor::open_external(&mut ctx),
+        Action::EditorFormatCommonSnippet { app_type } => {
+            editor::format_common_snippet(&mut ctx, app_type)
+        }
+        Action::EditorExtractCommonSnippet { app_type } => {
+            editor::extract_common_snippet_into_editor(&mut ctx, app_type)
+        }
         Action::EditorSubmit { submit, content } => editor::submit(&mut ctx, submit, content),
         Action::ProviderSwitch { id } => providers::switch(&mut ctx, id),
         Action::ProviderRemoveFromConfig { id } => providers::remove_from_config(&mut ctx, id),

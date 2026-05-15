@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn config_e_key_opens_common_snippet_picker_when_selected() {
+    fn config_e_key_opens_common_snippet_editor_when_selected() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Config;
         app.focus = Focus::Content;
@@ -600,7 +600,16 @@ mod tests {
 
         let action = app.on_key(key(KeyCode::Char('e')), &data());
         assert!(matches!(action, Action::None));
-        assert!(matches!(app.overlay, Overlay::CommonSnippetPicker { .. }));
+        assert!(matches!(
+            app.editor.as_ref().map(|e| (&e.kind, &e.submit)),
+            Some((
+                EditorKind::Json,
+                EditorSubmit::ConfigCommonSnippet {
+                    app_type: AppType::Claude,
+                    source: CommonSnippetViewSource::Global
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -3033,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn config_common_snippet_picker_and_view_support_edit_clear_apply_actions() {
+    fn config_common_snippet_opens_editor_directly() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Config;
         app.focus = Focus::Content;
@@ -3044,42 +3053,21 @@ mod tests {
 
         let data = UiData::default();
         app.on_key(key(KeyCode::Enter), &data);
-        assert!(matches!(app.overlay, Overlay::CommonSnippetPicker { .. }));
-
-        // Picker default should be the current app type (Claude). Enter opens the preview overlay.
-        app.on_key(key(KeyCode::Enter), &data);
         assert!(matches!(
-            app.overlay,
-            Overlay::CommonSnippetView {
-                app_type: AppType::Claude,
-                ..
-            }
-        ));
-
-        assert!(matches!(
-            app.on_key(key(KeyCode::Char('a')), &data),
-            Action::ConfigCommonSnippetApply {
-                app_type: AppType::Claude
-            }
-        ));
-        assert!(matches!(
-            app.on_key(key(KeyCode::Char('c')), &data),
-            Action::ConfigCommonSnippetClear {
-                app_type: AppType::Claude
-            }
-        ));
-
-        let action = app.on_key(key(KeyCode::Char('e')), &data);
-        assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.editor.as_ref().map(|e| e.kind),
-            Some(EditorKind::Json)
+            app.editor.as_ref().map(|e| (&e.kind, &e.submit)),
+            Some((
+                EditorKind::Json,
+                EditorSubmit::ConfigCommonSnippet {
+                    app_type: AppType::Claude,
+                    source: CommonSnippetViewSource::Global
+                }
+            ))
         ));
     }
 
     #[test]
-    fn config_common_snippet_picker_shows_snippet_for_non_current_app() {
-        let mut app = App::new(Some(AppType::Claude));
+    fn config_common_snippet_codex_opens_toml_editor_directly() {
+        let mut app = App::new(Some(AppType::Codex));
         app.route = Route::Config;
         app.focus = Focus::Content;
         app.config_idx = ConfigItem::ALL
@@ -3088,12 +3076,31 @@ mod tests {
             .expect("CommonSnippet missing from ConfigItem::ALL");
 
         let mut data = UiData::default();
-        data.config.common_snippets.codex = Some("disable_response_storage = true".to_string());
+        data.config.common_snippet = "disable_response_storage = true".to_string();
 
         app.on_key(key(KeyCode::Enter), &data);
-        assert!(matches!(app.overlay, Overlay::CommonSnippetPicker { .. }));
+        let editor = app.editor.as_ref().expect("expected common snippet editor");
+        assert_eq!(editor.kind, EditorKind::Toml);
+        assert_eq!(
+            editor.submit,
+            EditorSubmit::ConfigCommonSnippet {
+                app_type: AppType::Codex,
+                source: CommonSnippetViewSource::Global
+            }
+        );
+        assert!(editor.text().contains("disable_response_storage"));
+    }
 
-        app.on_key(key(KeyCode::Down), &data); // Claude -> Codex
+    #[test]
+    fn common_snippet_picker_compat_still_shows_snippet_for_non_current_app() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.overlay = Overlay::CommonSnippetPicker {
+            selected: snippet_picker_index_for_app_type(&AppType::Codex),
+        };
+
+        let mut data = UiData::default();
+        data.config.common_snippets.codex = Some("disable_response_storage = true".to_string());
+
         app.on_key(key(KeyCode::Enter), &data);
 
         let snippet = match &app.overlay {
@@ -3171,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_add_form_common_snippet_row_opens_view_claude() {
+    fn provider_add_form_common_snippet_row_opens_json_editor_claude() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Providers;
         app.focus = Focus::Content;
@@ -3182,17 +3189,6 @@ mod tests {
         select_provider_common_snippet_row(&mut app);
 
         let action = app.on_key(key(KeyCode::Enter), &data);
-        assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.overlay,
-            Overlay::CommonSnippetView {
-                app_type: AppType::Claude,
-                source: CommonSnippetViewSource::ProviderForm,
-                ..
-            }
-        ));
-
-        let action = app.on_key(key(KeyCode::Char('e')), &data);
         assert!(matches!(action, Action::None));
         assert!(matches!(
             app.editor.as_ref().map(|e| (&e.kind, &e.submit)),
@@ -3207,7 +3203,60 @@ mod tests {
     }
 
     #[test]
-    fn provider_add_form_common_snippet_row_opens_view_codex() {
+    fn common_snippet_editor_function_keys_trigger_format_and_extract() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+
+        let data = data();
+        app.on_key(key(KeyCode::Char('a')), &data);
+        app.on_key(key(KeyCode::Enter), &data); // apply template -> fields
+        select_provider_common_snippet_row(&mut app);
+        app.on_key(key(KeyCode::Enter), &data);
+
+        assert!(matches!(
+            app.on_key(key(KeyCode::F(2)), &data),
+            Action::EditorFormatCommonSnippet {
+                app_type: AppType::Claude
+            }
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::F(4)), &data),
+            Action::EditorExtractCommonSnippet {
+                app_type: AppType::Claude
+            }
+        ));
+    }
+
+    #[test]
+    fn global_common_snippet_editor_only_formats_not_extracts() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Config;
+        app.focus = Focus::Content;
+        app.open_common_snippet_editor(
+            AppType::Claude,
+            &data(),
+            Some(r#"{"env":{"COMMON_FLAG":"1"}}"#.to_string()),
+            CommonSnippetViewSource::Global,
+        );
+
+        assert!(matches!(
+            app.on_key(key(KeyCode::F(2)), &data()),
+            Action::EditorFormatCommonSnippet {
+                app_type: AppType::Claude
+            }
+        ));
+
+        let before = app.editor.as_ref().map(|editor| editor.text());
+        assert!(matches!(
+            app.on_key(key(KeyCode::F(4)), &data()),
+            Action::None
+        ));
+        assert_eq!(app.editor.as_ref().map(|editor| editor.text()), before);
+    }
+
+    #[test]
+    fn provider_add_form_common_snippet_row_opens_toml_editor_codex() {
         let mut app = App::new(Some(AppType::Codex));
         app.route = Route::Providers;
         app.focus = Focus::Content;
@@ -3220,20 +3269,9 @@ mod tests {
         let action = app.on_key(key(KeyCode::Enter), &data);
         assert!(matches!(action, Action::None));
         assert!(matches!(
-            app.overlay,
-            Overlay::CommonSnippetView {
-                app_type: AppType::Codex,
-                source: CommonSnippetViewSource::ProviderForm,
-                ..
-            }
-        ));
-
-        let action = app.on_key(key(KeyCode::Char('e')), &data);
-        assert!(matches!(action, Action::None));
-        assert!(matches!(
             app.editor.as_ref().map(|e| (&e.kind, &e.submit)),
             Some((
-                EditorKind::Plain,
+                EditorKind::Toml,
                 EditorSubmit::ConfigCommonSnippet {
                     app_type: AppType::Codex,
                     source: CommonSnippetViewSource::ProviderForm
@@ -3243,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_add_form_common_snippet_row_opens_view_gemini() {
+    fn provider_add_form_common_snippet_row_opens_json_editor_gemini() {
         let mut app = App::new(Some(AppType::Gemini));
         app.route = Route::Providers;
         app.focus = Focus::Content;
@@ -3254,17 +3292,6 @@ mod tests {
         select_provider_common_snippet_row(&mut app);
 
         let action = app.on_key(key(KeyCode::Enter), &data);
-        assert!(matches!(action, Action::None));
-        assert!(matches!(
-            app.overlay,
-            Overlay::CommonSnippetView {
-                app_type: AppType::Gemini,
-                source: CommonSnippetViewSource::ProviderForm,
-                ..
-            }
-        ));
-
-        let action = app.on_key(key(KeyCode::Char('e')), &data);
         assert!(matches!(action, Action::None));
         assert!(matches!(
             app.editor.as_ref().map(|e| (&e.kind, &e.submit)),
@@ -3288,7 +3315,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')), &data);
         app.on_key(key(KeyCode::Enter), &data); // apply template -> fields
         select_provider_common_snippet_row(&mut app);
-        app.on_key(key(KeyCode::Enter), &data);
+        app.open_provider_form_common_snippet_view(AppType::Claude, &data);
 
         assert!(matches!(
             app.on_key(key(KeyCode::Char('a')), &data),

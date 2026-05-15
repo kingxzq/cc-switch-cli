@@ -782,6 +782,14 @@ pub fn tui_key_extract() -> &'static str {
     }
 }
 
+pub fn tui_key_format() -> &'static str {
+    if is_chinese() {
+        "格式化"
+    } else {
+        "format"
+    }
+}
+
 pub fn tui_key_edit_snippet() -> &'static str {
     if is_chinese() {
         "编辑片段"
