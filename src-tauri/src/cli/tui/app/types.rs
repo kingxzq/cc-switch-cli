@@ -58,6 +58,7 @@ impl Toast {
 pub enum ConfirmAction {
     Quit,
     ProviderDelete { id: String },
+    ProviderRemoveFromConfig { id: String },
     McpDelete { id: String },
     PromptDelete { id: String },
     SkillsUninstall { directory: String },
@@ -210,6 +211,9 @@ pub enum Overlay {
     UsageQueryTemplatePicker {
         selected: usize,
     },
+    HermesModelsPicker {
+        editing: bool,
+    },
     ModelFetchPicker {
         request_id: u64,
         field: ProviderAddField,
@@ -308,6 +312,7 @@ impl Overlay {
         match self {
             Overlay::TextInput(input) => input.is_editing(),
             Overlay::ClaudeModelPicker { editing, .. } => *editing,
+            Overlay::HermesModelsPicker { editing } => *editing,
             Overlay::ModelFetchPicker { .. } => true,
             Overlay::McpEnvEntryEditor(editor) => editor.is_editing(),
             Overlay::None
