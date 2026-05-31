@@ -14,6 +14,7 @@ pub mod provider;
 pub mod provider_input;
 mod provider_inspect;
 pub mod proxy;
+pub mod sessions;
 pub mod skills;
 pub mod start;
 pub mod update;

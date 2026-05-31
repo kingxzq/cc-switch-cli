@@ -59,6 +59,9 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Some(Commands::Failover(cmd)) => {
             cc_switch_lib::cli::commands::failover::execute(cmd, cli.app)
         }
+        Some(Commands::Sessions(cmd)) => {
+            cc_switch_lib::cli::commands::sessions::execute(cmd, cli.app)
+        }
         Some(Commands::Hermes(cmd)) => cc_switch_lib::cli::commands::hermes::execute(cmd),
         #[cfg(unix)]
         Some(Commands::Start(cmd)) => cc_switch_lib::cli::commands::start::execute(cmd),
@@ -80,7 +83,8 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
     match command {
         Some(Commands::Completions(_))
         | Some(Commands::Update(_))
-        | Some(Commands::Internal(_)) => false,
+        | Some(Commands::Internal(_))
+        | Some(Commands::Sessions(_)) => false,
         #[cfg(unix)]
         Some(Commands::Daemon(_)) => false,
         _ => true,
@@ -165,6 +169,7 @@ mod tests {
             "official",
             "/tmp/codex-home",
         ]);
+        let sessions = Cli::parse_from(["cc-switch", "sessions", "list"]);
         let provider = Cli::parse_from(["cc-switch", "provider", "list"]);
 
         assert!(!command_requires_startup_state(&update.command));
@@ -179,6 +184,7 @@ mod tests {
             &completions_uninstall.command
         ));
         assert!(!command_requires_startup_state(&internal_capture.command));
+        assert!(!command_requires_startup_state(&sessions.command));
         assert!(command_requires_startup_state(&provider.command));
     }
 

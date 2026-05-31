@@ -65,6 +65,10 @@ pub enum Commands {
     #[command(subcommand)]
     Failover(commands::failover::FailoverCommand),
 
+    /// Manage saved assistant sessions
+    #[command(subcommand)]
+    Sessions(commands::sessions::SessionsCommand),
+
     /// Hermes-specific commands (memory blobs etc.)
     #[command(subcommand)]
     Hermes(commands::hermes::HermesCommand),
@@ -315,6 +319,102 @@ mod tests {
         match cli.command {
             Some(Commands::Failover(super::commands::failover::FailoverCommand::Show)) => {}
             _ => panic!("expected failover show command"),
+        }
+    }
+
+    #[test]
+    fn parses_sessions_list_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "sessions", "list", "--all", "--json"]);
+
+        match cli.command {
+            Some(Commands::Sessions(super::commands::sessions::SessionsCommand::List {
+                provider,
+                all,
+                json,
+            })) => {
+                assert_eq!(provider, None);
+                assert!(all);
+                assert!(json);
+            }
+            _ => panic!("expected sessions list command"),
+        }
+    }
+
+    #[test]
+    fn parses_sessions_list_with_backend_provider_id() {
+        let cli = Cli::parse_from(["cc-switch", "sessions", "list", "--provider", "opencode"]);
+
+        match cli.command {
+            Some(Commands::Sessions(super::commands::sessions::SessionsCommand::List {
+                provider,
+                all,
+                ..
+            })) => {
+                assert_eq!(provider, Some(super::AppType::OpenCode));
+                assert!(!all);
+            }
+            _ => panic!("expected sessions list command"),
+        }
+    }
+
+    #[test]
+    fn parses_sessions_show_with_provider() {
+        let cli = Cli::parse_from([
+            "cc-switch",
+            "sessions",
+            "show",
+            "abc",
+            "--provider",
+            "openclaw",
+            "--json",
+        ]);
+
+        match cli.command {
+            Some(Commands::Sessions(super::commands::sessions::SessionsCommand::Show {
+                selector,
+                provider,
+                json,
+                ..
+            })) => {
+                assert_eq!(selector, "abc");
+                assert_eq!(provider, Some(super::AppType::OpenClaw));
+                assert!(json);
+            }
+            _ => panic!("expected sessions show command"),
+        }
+    }
+
+    #[test]
+    fn parses_sessions_resume_print_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "sessions", "resume", "abc", "--print"]);
+
+        match cli.command {
+            Some(Commands::Sessions(super::commands::sessions::SessionsCommand::Resume {
+                selector,
+                print,
+                ..
+            })) => {
+                assert_eq!(selector, "abc");
+                assert!(print);
+            }
+            _ => panic!("expected sessions resume command"),
+        }
+    }
+
+    #[test]
+    fn parses_sessions_delete_yes_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "sessions", "delete", "abc", "--yes"]);
+
+        match cli.command {
+            Some(Commands::Sessions(super::commands::sessions::SessionsCommand::Delete {
+                selector,
+                yes,
+                ..
+            })) => {
+                assert_eq!(selector, "abc");
+                assert!(yes);
+            }
+            _ => panic!("expected sessions delete command"),
         }
     }
 
