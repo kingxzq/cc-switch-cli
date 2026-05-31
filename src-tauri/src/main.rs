@@ -46,6 +46,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         // Default to interactive mode if no command is provided
         None | Some(Commands::Interactive) => cc_switch_lib::cli::interactive::run(cli.app),
+        Some(Commands::Auth(cmd)) => cc_switch_lib::cli::commands::auth::execute(cmd),
         Some(Commands::Provider(cmd)) => {
             cc_switch_lib::cli::commands::provider::execute(cmd, cli.app)
         }
@@ -82,6 +83,7 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
 
     match command {
         Some(Commands::Completions(_))
+        | Some(Commands::Auth(_))
         | Some(Commands::Update(_))
         | Some(Commands::Internal(_))
         | Some(Commands::Sessions(_)) => false,
@@ -170,6 +172,7 @@ mod tests {
             "/tmp/codex-home",
         ]);
         let sessions = Cli::parse_from(["cc-switch", "sessions", "list"]);
+        let auth = Cli::parse_from(["cc-switch", "auth", "status"]);
         let provider = Cli::parse_from(["cc-switch", "provider", "list"]);
 
         assert!(!command_requires_startup_state(&update.command));
@@ -185,6 +188,7 @@ mod tests {
         ));
         assert!(!command_requires_startup_state(&internal_capture.command));
         assert!(!command_requires_startup_state(&sessions.command));
+        assert!(!command_requires_startup_state(&auth.command));
         assert!(command_requires_startup_state(&provider.command));
     }
 

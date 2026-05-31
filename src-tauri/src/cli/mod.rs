@@ -37,6 +37,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Manage ChatGPT Codex OAuth accounts
+    #[command(subcommand)]
+    Auth(commands::auth::AuthCommand),
+
     /// Manage providers (list, switch, export, speedtest, stream-check, fetch-models)
     #[command(subcommand)]
     Provider(commands::provider::ProviderCommand),
@@ -415,6 +419,77 @@ mod tests {
                 assert!(yes);
             }
             _ => panic!("expected sessions delete command"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_status_json_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "auth", "status", "--json"]);
+
+        match cli.command {
+            Some(Commands::Auth(super::commands::auth::AuthCommand::Status { json })) => {
+                assert!(json);
+            }
+            _ => panic!("expected auth status command"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_login_json_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "auth", "login", "--json"]);
+
+        match cli.command {
+            Some(Commands::Auth(super::commands::auth::AuthCommand::Login { json })) => {
+                assert!(json);
+            }
+            _ => panic!("expected auth login command"),
+        }
+    }
+
+    #[test]
+    fn rejects_auth_login_no_poll_dead_end() {
+        let result = Cli::try_parse_from(["cc-switch", "auth", "login", "--no-poll"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_auth_default_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "auth", "default", "acc-123"]);
+
+        match cli.command {
+            Some(Commands::Auth(super::commands::auth::AuthCommand::Default { account_id })) => {
+                assert_eq!(account_id, "acc-123");
+            }
+            _ => panic!("expected auth default command"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_remove_yes_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "auth", "remove", "acc-123", "--yes"]);
+
+        match cli.command {
+            Some(Commands::Auth(super::commands::auth::AuthCommand::Remove {
+                account_id,
+                yes,
+            })) => {
+                assert_eq!(account_id, "acc-123");
+                assert!(yes);
+            }
+            _ => panic!("expected auth remove command"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_logout_yes_subcommand() {
+        let cli = Cli::parse_from(["cc-switch", "auth", "logout", "--yes"]);
+
+        match cli.command {
+            Some(Commands::Auth(super::commands::auth::AuthCommand::Logout { yes })) => {
+                assert!(yes);
+            }
+            _ => panic!("expected auth logout command"),
         }
     }
 
