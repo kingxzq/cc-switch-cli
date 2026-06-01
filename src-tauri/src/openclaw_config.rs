@@ -431,6 +431,11 @@ fn should_use_precise_empty_object_fallback(section: &str, value: &Value) -> boo
             .and_then(|models| models.get("providers"))
             .map(is_empty_object)
             .unwrap_or(false),
+        "agents" => value
+            .as_object()
+            .and_then(|agents| agents.get("defaults"))
+            .map(is_empty_object)
+            .unwrap_or(false),
         "tools" => is_empty_object(value),
         _ => false,
     }
@@ -1236,6 +1241,9 @@ mod tests {
             "providers": {}
         });
         let empty_tools_value = json!({});
+        let agents_with_empty_defaults = json!({
+            "defaults": {}
+        });
         let env_value = json!({
             "vars": {}
         });
@@ -1255,6 +1263,10 @@ mod tests {
         assert!(should_use_precise_empty_object_fallback(
             "tools",
             &empty_tools_value
+        ));
+        assert!(should_use_precise_empty_object_fallback(
+            "agents",
+            &agents_with_empty_defaults
         ));
         assert!(!should_use_precise_empty_object_fallback("env", &env_value));
         assert!(!should_use_precise_empty_object_fallback(
@@ -1293,6 +1305,29 @@ mod tests {
 
         assert_eq!(actual_env, expected_env);
         assert_eq!(actual_tools, expected_tools);
+    }
+
+    #[test]
+    #[serial]
+    fn agents_defaults_empty_object_write_does_not_panic() {
+        let source = r#"{
+  models: {
+    mode: 'merge',
+    providers: {},
+  },
+}
+"#;
+
+        with_test_paths(source, |config_path| {
+            set_agents_defaults(&OpenClawAgentsDefaults::default())
+                .expect("write empty agents.defaults");
+
+            let written = fs::read_to_string(config_path).expect("read written config");
+            assert!(
+                written.contains("defaults: {}"),
+                "agents.defaults should be serialized as an empty object: {written}"
+            );
+        });
     }
 
     #[test]

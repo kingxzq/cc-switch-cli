@@ -2,6 +2,7 @@ pub mod auth;
 pub mod completions;
 pub mod config;
 mod config_common;
+pub(crate) mod config_openclaw;
 pub mod config_webdav;
 #[cfg(unix)]
 pub mod daemon;

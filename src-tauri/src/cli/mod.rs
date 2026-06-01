@@ -9,6 +9,7 @@ pub mod editor;
 pub(crate) mod failover_policy;
 pub mod i18n;
 pub mod interactive;
+pub(crate) mod openclaw_form_normalization;
 pub mod terminal;
 pub mod tui;
 pub mod ui;
@@ -765,6 +766,119 @@ mod tests {
                 super::commands::config_webdav::WebDavCommand::CheckConnection,
             ))) => {}
             _ => panic!("expected config webdav check-connection command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_openclaw_env_put_subcommand() {
+        let cli = Cli::parse_from([
+            "cc-switch",
+            "config",
+            "openclaw",
+            "env",
+            "put",
+            "OPENCLAW_DEBUG",
+            "true",
+        ]);
+
+        match cli.command {
+            Some(Commands::Config(super::commands::config::ConfigCommand::OpenClaw(
+                super::commands::config_openclaw::OpenClawCommand::Env(
+                    super::commands::config_openclaw::OpenClawEnvCommand::Put { key, value },
+                ),
+            ))) => {
+                assert_eq!(key, "OPENCLAW_DEBUG");
+                assert_eq!(value, "true");
+            }
+            _ => panic!("expected config openclaw env put command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_openclaw_tools_allow_add_subcommand() {
+        let cli = Cli::parse_from([
+            "cc-switch",
+            "config",
+            "openclaw",
+            "tools",
+            "allow",
+            "add",
+            "Read",
+        ]);
+
+        match cli.command {
+            Some(Commands::Config(super::commands::config::ConfigCommand::OpenClaw(
+                super::commands::config_openclaw::OpenClawCommand::Tools(
+                    super::commands::config_openclaw::OpenClawToolsCommand::Allow(
+                        super::commands::config_openclaw::OpenClawRuleListCommand::Add { rule },
+                    ),
+                ),
+            ))) => {
+                assert_eq!(rule, "Read");
+            }
+            _ => panic!("expected config openclaw tools allow add command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_openclaw_agents_runtime_set_subcommand() {
+        let cli = Cli::parse_from([
+            "cc-switch",
+            "config",
+            "openclaw",
+            "agents",
+            "runtime",
+            "set",
+            "timeout-seconds",
+            "120",
+        ]);
+
+        match cli.command {
+            Some(Commands::Config(super::commands::config::ConfigCommand::OpenClaw(
+                super::commands::config_openclaw::OpenClawCommand::Agents(
+                    super::commands::config_openclaw::OpenClawAgentsCommand::Runtime(
+                        super::commands::config_openclaw::OpenClawAgentsRuntimeCommand::Set {
+                            field,
+                            value,
+                        },
+                    ),
+                ),
+            ))) => {
+                assert!(matches!(
+                    field,
+                    super::commands::config_openclaw::OpenClawRuntimeField::TimeoutSeconds
+                ));
+                assert_eq!(value, "120");
+            }
+            _ => panic!("expected config openclaw agents runtime set command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_openclaw_memory_delete_yes_subcommand() {
+        let cli = Cli::parse_from([
+            "cc-switch",
+            "config",
+            "openclaw",
+            "memory",
+            "delete",
+            "2026-06-01.md",
+            "--yes",
+        ]);
+
+        match cli.command {
+            Some(Commands::Config(super::commands::config::ConfigCommand::OpenClaw(
+                super::commands::config_openclaw::OpenClawCommand::Memory(
+                    super::commands::config_openclaw::OpenClawMemoryCommand::Delete {
+                        filename,
+                        yes,
+                    },
+                ),
+            ))) => {
+                assert_eq!(filename, "2026-06-01.md");
+                assert!(yes);
+            }
+            _ => panic!("expected config openclaw memory delete command"),
         }
     }
 
