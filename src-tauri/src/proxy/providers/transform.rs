@@ -372,6 +372,9 @@ fn convert_message_to_openai(
                         }
                     }
                 }
+                "redacted_thinking" if preserve_reasoning_content => {
+                    reasoning_parts.push("[redacted thinking]".to_string());
+                }
                 _ => {}
             }
         }
@@ -877,6 +880,28 @@ mod tests {
         let result = anthropic_to_openai_with_reasoning_content(input, None, true).unwrap();
 
         assert_eq!(result["messages"][0]["reasoning_content"], "tool call");
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_use_uses_redacted_thinking_placeholder() {
+        let input = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Tokyo"}}
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai_with_reasoning_content(input, None, true).unwrap();
+
+        assert_eq!(
+            result["messages"][0]["reasoning_content"],
+            "[redacted thinking]"
+        );
+        assert_eq!(result["messages"][0]["tool_calls"][0]["id"], "call_1");
     }
 
     #[test]
