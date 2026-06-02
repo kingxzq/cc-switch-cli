@@ -29,6 +29,7 @@ pub use auth::{AuthInfo, AuthStrategy};
 #[allow(unused_imports)]
 pub use claude::{
     claude_api_format_needs_transform, get_claude_api_format,
+    normalize_anthropic_tool_thinking_history_for_provider,
     transform_claude_request_for_api_format, transform_claude_request_for_api_format_with_shadow,
     transform_gemini_response_for_provider, ClaudeAdapter,
 };

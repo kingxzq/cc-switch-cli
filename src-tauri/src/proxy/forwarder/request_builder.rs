@@ -12,6 +12,7 @@ use super::super::{
     model_mapper::apply_model_mapping,
     providers::{
         apply_codex_chat_upstream_model, claude_api_format_needs_transform, get_adapter,
+        normalize_anthropic_tool_thinking_history_for_provider,
         resolve_codex_chat_reasoning_config, should_convert_codex_responses_to_chat,
         transform_codex_chat, AuthStrategy, ProviderAdapter,
     },
@@ -127,6 +128,15 @@ impl RequestForwarder {
         } else {
             None
         };
+        if is_claude_request {
+            if let Some(api_format) = claude_api_format.as_deref() {
+                normalize_anthropic_tool_thinking_history_for_provider(
+                    &mut mapped_body,
+                    provider,
+                    api_format,
+                );
+            }
+        }
         let needs_transform = match claude_api_format.as_deref() {
             Some(api_format) => claude_api_format_needs_transform(api_format),
             None => adapter.needs_transform(provider),

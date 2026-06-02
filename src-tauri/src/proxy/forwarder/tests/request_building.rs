@@ -161,6 +161,57 @@ async fn non_bedrock_claude_prepare_request_skips_optimizer_and_cache_injection(
 }
 
 #[tokio::test]
+async fn deepseek_native_claude_prepare_request_normalizes_tool_thinking_history_before_send() {
+    let (base_url, hits, bodies, server) =
+        spawn_scripted_upstream(vec![(StatusCode::OK, json!({"ok": true}))]).await;
+    let provider = claude_provider("deepseek", &base_url, None);
+    let (_db, router) = test_router().await;
+    let forwarder = RequestForwarder::new(router).expect("create forwarder");
+
+    let body = json!({
+        "model": "deepseek-v4-pro",
+        "max_tokens": 32,
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call_123", "name": "read_file", "input": {"path": "README.md"}}
+            ]
+        }]
+    });
+
+    let response = forwarder
+        .forward_buffered_response(
+            &AppType::Claude,
+            "/v1/messages",
+            body,
+            &HeaderMap::new(),
+            vec![provider],
+            ForwardOptions {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_secs(2)),
+                bypass_circuit_breaker: true,
+            },
+            RectifierConfig::default(),
+        )
+        .await
+        .expect("DeepSeek native Claude request should succeed");
+
+    assert_eq!(response.response.status, StatusCode::OK);
+    assert_eq!(hits.count.load(Ordering::SeqCst), 1);
+
+    let sent = bodies.lock().await;
+    let sent = sent.first().expect("captured upstream request body");
+    let content = sent["messages"][0]["content"]
+        .as_array()
+        .expect("assistant content should be array");
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "tool call");
+    assert_eq!(content[1]["type"], "tool_use");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn claude_prepare_request_appends_claude_code_beta_to_existing_header() {
     let mut headers = HeaderMap::new();
     headers.insert("anthropic-beta", HeaderValue::from_static("existing-beta"));
