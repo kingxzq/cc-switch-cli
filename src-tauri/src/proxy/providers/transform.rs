@@ -1,4 +1,4 @@
-use crate::proxy::error::ProxyError;
+use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 
@@ -365,7 +365,7 @@ fn convert_message_to_openai(
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": serde_json::to_string(&input).unwrap_or_default()
+                            "arguments": canonical_json_string(&input)
                         }
                     }));
                 }
@@ -377,7 +377,7 @@ fn convert_message_to_openai(
                     let content_val = block.get("content");
                     let content_str = match content_val {
                         Some(Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                        Some(v) => canonical_json_string(v),
                         None => String::new(),
                     };
                     result.push(json!({
@@ -991,6 +991,67 @@ mod tests {
             "[redacted thinking]"
         );
         assert_eq!(result["messages"][0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_use_arguments_are_canonical_json() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "lookup",
+                        "input": {
+                            "z": 1,
+                            "a": {
+                                "b": 2,
+                                "a": 1
+                            }
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(
+            result["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"a":{"a":1,"b":2},"z":1}"#
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_result_content_is_canonical_json() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": {
+                        "z": 1,
+                        "a": {
+                            "b": 2,
+                            "a": 1
+                        }
+                    }
+                }]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], "tool");
+        assert_eq!(result["messages"][0]["tool_call_id"], "call_1");
+        assert_eq!(
+            result["messages"][0]["content"],
+            r#"{"a":{"a":1,"b":2},"z":1}"#
+        );
     }
 
     #[test]
