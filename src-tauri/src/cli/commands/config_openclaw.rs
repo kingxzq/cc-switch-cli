@@ -234,6 +234,9 @@ pub enum OpenClawWorkspaceCommand {
         #[arg(long)]
         content: Option<String>,
     },
+    /// Open the OpenClaw workspace directory in the system file manager
+    #[command(name = "open-dir")]
+    OpenDir,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -270,6 +273,9 @@ pub enum OpenClawMemoryCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Open the OpenClaw daily memory directory in the system file manager
+    #[command(name = "open-dir")]
+    OpenDir,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -371,6 +377,7 @@ fn execute_workspace(cmd: OpenClawWorkspaceCommand) -> Result<(), AppError> {
         OpenClawWorkspaceCommand::Set { filename, content } => {
             set_workspace_file(&filename, content)
         }
+        OpenClawWorkspaceCommand::OpenDir => open_workspace_dir(),
     }
 }
 
@@ -381,6 +388,7 @@ fn execute_memory(cmd: OpenClawMemoryCommand) -> Result<(), AppError> {
         OpenClawMemoryCommand::Set { filename, content } => set_memory_file(&filename, content),
         OpenClawMemoryCommand::Search { query, json } => search_memory(&query, json),
         OpenClawMemoryCommand::Delete { filename, yes } => delete_memory(&filename, yes),
+        OpenClawMemoryCommand::OpenDir => open_memory_dir(),
     }
 }
 
@@ -889,6 +897,12 @@ fn set_workspace_file(filename: &str, content: Option<String>) -> Result<(), App
     Ok(())
 }
 
+fn open_workspace_dir() -> Result<(), AppError> {
+    workspace::open_workspace_directory((), String::new()).map_err(AppError::Message)?;
+    println!("{}", success("Opened OpenClaw workspace directory."));
+    Ok(())
+}
+
 fn list_memory(json: bool) -> Result<(), AppError> {
     let files = workspace::list_daily_memory_files().map_err(AppError::Message)?;
     if json {
@@ -970,6 +984,12 @@ fn delete_memory(filename: &str, yes: bool) -> Result<(), AppError> {
 
     workspace::delete_daily_memory_file(filename.to_string()).map_err(AppError::Message)?;
     println!("{}", success("OpenClaw daily memory file deleted."));
+    Ok(())
+}
+
+fn open_memory_dir() -> Result<(), AppError> {
+    workspace::open_workspace_directory((), "memory".to_string()).map_err(AppError::Message)?;
+    println!("{}", success("Opened OpenClaw daily memory directory."));
     Ok(())
 }
 
@@ -1094,6 +1114,7 @@ mod tests {
         old_home: Option<OsString>,
         old_userprofile: Option<OsString>,
         old_config_dir: Option<OsString>,
+        old_disable_open: Option<OsString>,
         _home: TempDir,
     }
 
@@ -1104,9 +1125,11 @@ mod tests {
             let old_home = std::env::var_os("HOME");
             let old_userprofile = std::env::var_os("USERPROFILE");
             let old_config_dir = std::env::var_os("CC_SWITCH_CONFIG_DIR");
+            let old_disable_open = std::env::var_os("CC_SWITCH_TEST_DISABLE_OPEN");
             std::env::set_var("HOME", home.path());
             std::env::set_var("USERPROFILE", home.path());
             std::env::set_var("CC_SWITCH_CONFIG_DIR", home.path().join(".cc-switch"));
+            std::env::set_var("CC_SWITCH_TEST_DISABLE_OPEN", "1");
             set_test_home_override(Some(home.path()));
             crate::settings::reload_test_settings();
             Self {
@@ -1114,8 +1137,17 @@ mod tests {
                 old_home,
                 old_userprofile,
                 old_config_dir,
+                old_disable_open,
                 _home: home,
             }
+        }
+
+        fn workspace_dir(&self) -> std::path::PathBuf {
+            self._home.path().join(".openclaw").join("workspace")
+        }
+
+        fn memory_dir(&self) -> std::path::PathBuf {
+            self.workspace_dir().join("memory")
         }
     }
 
@@ -1132,6 +1164,10 @@ mod tests {
             match &self.old_config_dir {
                 Some(value) => std::env::set_var("CC_SWITCH_CONFIG_DIR", value),
                 None => std::env::remove_var("CC_SWITCH_CONFIG_DIR"),
+            }
+            match &self.old_disable_open {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_DISABLE_OPEN", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_DISABLE_OPEN"),
             }
             set_test_home_override(self.old_home.as_deref().map(Path::new));
             crate::settings::reload_test_settings();
@@ -1269,5 +1305,24 @@ mod tests {
         let err = show_memory_file("today.md").expect_err("reject invalid file");
 
         assert!(err.to_string().contains("Invalid daily memory filename"));
+    }
+
+    #[test]
+    fn config_openclaw_workspace_open_dir_creates_workspace_directory() {
+        let env = EnvGuard::new();
+
+        open_workspace_dir().expect("open workspace dir");
+
+        assert!(env.workspace_dir().is_dir());
+        assert!(!env.memory_dir().exists());
+    }
+
+    #[test]
+    fn config_openclaw_memory_open_dir_creates_daily_memory_directory() {
+        let env = EnvGuard::new();
+
+        open_memory_dir().expect("open memory dir");
+
+        assert!(env.memory_dir().is_dir());
     }
 }
