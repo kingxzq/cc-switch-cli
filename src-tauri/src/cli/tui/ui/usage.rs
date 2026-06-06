@@ -25,7 +25,7 @@ pub(super) fn render_usage(
         .constraints([
             Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -178,6 +178,23 @@ fn render_usage_metrics(
         return;
     }
 
+    if inner.height >= 5 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+        render_usage_metric_row(frame, rows[0], &usage_primary_metrics(summary), theme);
+        render_usage_metric_row(frame, rows[1], &usage_secondary_metrics(summary), theme);
+        render_usage_cache_hit_line(frame, summary, rows[2], theme);
+        return;
+    }
+
     if inner.height >= 4 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -218,6 +235,31 @@ fn usage_primary_metrics(summary: &UsageSummarySnapshot) -> [UsageMetricCard; 4]
         UsageMetricCard {
             label: usage_text("Success", "成功率"),
             value: format_percent(summary.success_rate()),
+        },
+    ]
+}
+
+fn usage_secondary_metrics(summary: &UsageSummarySnapshot) -> [UsageMetricCard; 4] {
+    [
+        UsageMetricCard {
+            label: usage_text("Input / Output", "输入 / 输出"),
+            value: format!(
+                "{} / {}",
+                format_token_compact(summary.input_tokens),
+                format_token_compact(summary.output_tokens)
+            ),
+        },
+        UsageMetricCard {
+            label: usage_text("Cache Read", "缓存读取"),
+            value: format_token_compact(summary.cache_read_tokens),
+        },
+        UsageMetricCard {
+            label: usage_text("Cache Write", "缓存写入"),
+            value: format_token_compact(summary.cache_creation_tokens),
+        },
+        UsageMetricCard {
+            label: usage_text("Avg Latency", "平均延迟"),
+            value: format_ms(summary.avg_latency_ms),
         },
     ]
 }

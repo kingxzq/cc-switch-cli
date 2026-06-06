@@ -170,8 +170,10 @@ fn tui_usage_renders_summary_and_trend() {
     assert!(all.contains("$1.250"), "{all}");
     assert!(all.contains("1.8k"), "{all}");
     assert!(all.contains("Real Tokens"), "{all}");
-    assert!(!all.contains("Cache Read"), "{all}");
-    assert!(!all.contains("Cache Write"), "{all}");
+    assert!(all.contains("Input / Output"), "{all}");
+    assert!(all.contains("Cache Read"), "{all}");
+    assert!(all.contains("Cache Write"), "{all}");
+    assert!(all.contains("Avg Latency"), "{all}");
     assert!(all.contains("Cache Hit"), "{all}");
     assert!(all.contains("19%"), "{all}");
     assert!(all.contains("06/05"), "{all}");
