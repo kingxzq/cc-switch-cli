@@ -839,7 +839,9 @@ fn app_data_worker_loop(rx: mpsc::Receiver<AppDataReq>, tx: mpsc::Sender<AppData
                 state_cache = None;
                 let _ = ack.send(());
             }
-            req @ (AppDataReq::InitialLoad { .. } | AppDataReq::Load { .. }) => {
+            req @ (AppDataReq::InitialLoad { .. }
+            | AppDataReq::Load { .. }
+            | AppDataReq::FullLoad { .. }) => {
                 let mut backlog = VecDeque::from([req]);
                 drain_latest_by_key(&mut backlog, &mut deferred, &rx, app_data_req_key);
 
@@ -887,6 +889,7 @@ fn app_data_req_key(req: &AppDataReq) -> Option<(AppType, AppDataLoadKind)> {
             Some((app_type.clone(), AppDataLoadKind::Initial))
         }
         AppDataReq::Load { app_type, .. } => Some((app_type.clone(), AppDataLoadKind::Snapshot)),
+        AppDataReq::FullLoad { app_type, .. } => Some((app_type.clone(), AppDataLoadKind::Full)),
         AppDataReq::DropState { .. } => None,
     }
 }
@@ -1251,6 +1254,22 @@ fn handle_app_data_req(
                 .map_err(|err| err.to_string());
             (
                 AppDataLoadKind::Snapshot,
+                request_id,
+                generation,
+                app_state_epoch,
+                app_type,
+                result,
+            )
+        }
+        AppDataReq::FullLoad {
+            request_id,
+            generation,
+            app_state_epoch,
+            app_type,
+        } => {
+            let result = UiData::load(&app_type).map_err(|err| err.to_string());
+            (
+                AppDataLoadKind::Full,
                 request_id,
                 generation,
                 app_state_epoch,
@@ -1791,6 +1810,7 @@ mod tests {
                     (AppDataLoadKind::Initial, request_id)
                 }
                 AppDataReq::Load { request_id, .. } => (AppDataLoadKind::Snapshot, request_id),
+                AppDataReq::FullLoad { request_id, .. } => (AppDataLoadKind::Full, request_id),
                 AppDataReq::DropState { .. } => panic!("unexpected DropState in backlog"),
             })
             .collect::<Vec<_>>();

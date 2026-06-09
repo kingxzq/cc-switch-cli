@@ -23,7 +23,7 @@ use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::error::AppError;
 
-use app::{Action, App, LoadingKind, Overlay, ToastKind};
+use app::{Action, App, EditorSubmit, LoadingKind, Overlay, ToastKind};
 use runtime_actions::{apply_preloaded_app_switch, handle_action};
 #[cfg(test)]
 use runtime_actions::{
@@ -332,8 +332,17 @@ fn align_usage_to_active_range(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheInvalidation {
     None,
+    CurrentAppDataChanged,
     DataReloaded,
     AppStateRecreated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppDataLoadQueued {
+    Queued,
+    AlreadyPending,
+    Unavailable,
+    SendFailed,
 }
 
 impl UiDataByAppCache {
@@ -395,14 +404,66 @@ impl UiDataByAppCache {
         self.clear();
     }
 
+    fn remove_app_snapshot(&mut self, app_type: &AppType) {
+        self.by_app.remove(app_type);
+        self.pending_by_app.remove(app_type);
+        self.incomplete_by_app.remove(app_type);
+    }
+
+    fn remove_usage_pricing_for_app(&mut self, app_type: &AppType) {
+        self.usage_pricing_by_key
+            .retain(|(cached_app_type, _), _| cached_app_type != app_type);
+        self.pending_usage_pricing_by_key
+            .retain(|(cached_app_type, _), _| cached_app_type != app_type);
+    }
+
+    fn queue_current_app_data_refresh(
+        &mut self,
+        app_data_req_tx: Option<&mpsc::Sender<AppDataReq>>,
+        app_type: &AppType,
+    ) -> AppDataLoadQueued {
+        if self.pending_by_app.contains_key(app_type) {
+            return AppDataLoadQueued::AlreadyPending;
+        }
+
+        let Some(tx) = app_data_req_tx else {
+            return AppDataLoadQueued::Unavailable;
+        };
+
+        self.next_app_data_request_id = self.next_app_data_request_id.wrapping_add(1);
+        let request_id = self.next_app_data_request_id;
+        let pending = PendingAppDataLoad {
+            kind: AppDataLoadKind::Full,
+            request_id,
+            generation: self.data_generation,
+            app_state_epoch: self.app_state_epoch,
+        };
+        self.pending_by_app.insert(app_type.clone(), pending);
+        self.incomplete_by_app.insert(app_type.clone());
+        if tx
+            .send(AppDataReq::FullLoad {
+                request_id,
+                generation: pending.generation,
+                app_state_epoch: pending.app_state_epoch,
+                app_type: app_type.clone(),
+            })
+            .is_err()
+        {
+            self.remove_app_snapshot(app_type);
+            AppDataLoadQueued::SendFailed
+        } else {
+            AppDataLoadQueued::Queued
+        }
+    }
+
     fn queue_app_data_load(
         &mut self,
         app: &mut App,
         app_data_req_tx: Option<&mpsc::Sender<AppDataReq>>,
         app_type: &AppType,
-    ) {
+    ) -> AppDataLoadQueued {
         if self.pending_by_app.contains_key(app_type) {
-            return;
+            return AppDataLoadQueued::AlreadyPending;
         }
 
         let Some(tx) = app_data_req_tx else {
@@ -411,7 +472,7 @@ impl UiDataByAppCache {
                 "App data worker is not running; reload data to refresh this app.".to_string(),
                 ToastKind::Warning,
             );
-            return;
+            return AppDataLoadQueued::Unavailable;
         };
 
         self.next_app_data_request_id = self.next_app_data_request_id.wrapping_add(1);
@@ -435,6 +496,9 @@ impl UiDataByAppCache {
                 format!("App data refresh request failed: {err}"),
                 ToastKind::Warning,
             );
+            AppDataLoadQueued::SendFailed
+        } else {
+            AppDataLoadQueued::Queued
         }
     }
 
@@ -594,12 +658,15 @@ impl UiDataByAppCache {
         invalidation: CacheInvalidation,
     ) {
         match invalidation {
-            CacheInvalidation::None => {}
+            CacheInvalidation::None | CacheInvalidation::CurrentAppDataChanged => {}
             CacheInvalidation::DataReloaded => self.clear(),
             CacheInvalidation::AppStateRecreated => self.clear_after_app_state_recreated(),
         }
 
-        if !matches!(invalidation, CacheInvalidation::None) {
+        if !matches!(
+            invalidation,
+            CacheInvalidation::None | CacheInvalidation::CurrentAppDataChanged
+        ) {
             self.remember_current(&app.app_type, data);
         }
     }
@@ -690,6 +757,7 @@ fn handle_app_data_msg(
     data: &mut data::UiData,
     data_cache: &mut UiDataByAppCache,
     quota_req_tx: Option<&mpsc::Sender<QuotaReq>>,
+    usage_pricing_req_tx: Option<&mpsc::Sender<UsagePricingReq>>,
     msg: AppDataMsg,
 ) {
     match msg {
@@ -713,6 +781,27 @@ fn handle_app_data_msg(
 
             match result {
                 Ok(mut loaded) => {
+                    if matches!(kind, AppDataLoadKind::Full) {
+                        data_cache.remove_usage_pricing_for_app(&app_type);
+                        data_cache.mark_app_data_loaded(&app_type);
+                        if app.app_type == app_type {
+                            *data = loaded;
+                            if let Err(err) = apply_loaded_data_cache_invalidation(
+                                app,
+                                data,
+                                data_cache,
+                                quota_req_tx,
+                                usage_pricing_req_tx,
+                                CacheInvalidation::DataReloaded,
+                            ) {
+                                app.push_toast(err.to_string(), ToastKind::Warning);
+                            }
+                        } else {
+                            data_cache.by_app.insert(app_type, loaded);
+                        }
+                        return;
+                    }
+
                     let active_range = if app.app_type == app_type {
                         app.usage.range
                     } else {
@@ -739,6 +828,9 @@ fn handle_app_data_msg(
                 }
                 Err(err) => {
                     if app.app_type == app_type {
+                        if matches!(kind, AppDataLoadKind::Full) {
+                            app.usage.clear_loading();
+                        }
                         app.push_toast(
                             format!("App data refresh failed: {err}"),
                             ToastKind::Warning,
@@ -880,6 +972,18 @@ fn cache_invalidation_for_action(action: &Action) -> CacheInvalidation {
         | Action::ConfigWebDavDownload
         | Action::ConfigWebDavMigrateV1ToV2 => CacheInvalidation::AppStateRecreated,
 
+        Action::ProviderSwitch { .. }
+        | Action::ProviderRemoveFromConfig { .. }
+        | Action::ProviderSetDefaultModel { .. }
+        | Action::ProviderImportLiveConfig
+        | Action::ProviderDelete { .. }
+        | Action::ProviderSetFailoverQueue { .. }
+        | Action::ProviderMoveFailoverQueue { .. }
+        | Action::EditorSubmit {
+            submit: EditorSubmit::ProviderAdd | EditorSubmit::ProviderEdit { .. },
+            ..
+        } => CacheInvalidation::CurrentAppDataChanged,
+
         Action::ReloadData
         | Action::SetVisibleAppsMode { .. }
         | Action::SetVisibleApps { .. }
@@ -894,13 +998,6 @@ fn cache_invalidation_for_action(action: &Action) -> CacheInvalidation {
         | Action::SkillsRepoRemove { .. }
         | Action::SkillsRepoToggleEnabled { .. }
         | Action::SkillsImportFromApps { .. }
-        | Action::ProviderSwitch { .. }
-        | Action::ProviderRemoveFromConfig { .. }
-        | Action::ProviderSetDefaultModel { .. }
-        | Action::ProviderImportLiveConfig
-        | Action::ProviderDelete { .. }
-        | Action::ProviderSetFailoverQueue { .. }
-        | Action::ProviderMoveFailoverQueue { .. }
         | Action::PricingDelete { .. }
         | Action::McpToggle { .. }
         | Action::McpSetApps { .. }
@@ -987,6 +1084,35 @@ fn apply_cache_invalidation(
         drop_cached_worker_state(app_data_req_tx, usage_pricing_req_tx)?;
     }
 
+    if matches!(invalidation, CacheInvalidation::CurrentAppDataChanged) {
+        return apply_current_app_data_changed(
+            app,
+            data,
+            data_cache,
+            quota_req_tx,
+            app_data_req_tx,
+            usage_pricing_req_tx,
+        );
+    }
+
+    apply_loaded_data_cache_invalidation(
+        app,
+        data,
+        data_cache,
+        quota_req_tx,
+        usage_pricing_req_tx,
+        invalidation,
+    )
+}
+
+fn apply_loaded_data_cache_invalidation(
+    app: &mut App,
+    data: &mut data::UiData,
+    data_cache: &mut UiDataByAppCache,
+    quota_req_tx: Option<&mpsc::Sender<QuotaReq>>,
+    usage_pricing_req_tx: Option<&mpsc::Sender<UsagePricingReq>>,
+    invalidation: CacheInvalidation,
+) -> Result<(), AppError> {
     let active_custom_range = if matches!(invalidation, CacheInvalidation::None) {
         None
     } else if let data::UsageRangePreset::Custom(range) = app.usage.range {
@@ -1017,6 +1143,35 @@ fn apply_cache_invalidation(
     }
 
     Ok(())
+}
+
+fn apply_current_app_data_changed(
+    app: &mut App,
+    data: &mut data::UiData,
+    data_cache: &mut UiDataByAppCache,
+    quota_req_tx: Option<&mpsc::Sender<QuotaReq>>,
+    app_data_req_tx: Option<&mpsc::Sender<AppDataReq>>,
+    usage_pricing_req_tx: Option<&mpsc::Sender<UsagePricingReq>>,
+) -> Result<(), AppError> {
+    let current_app_type = app.app_type.clone();
+    data_cache.remove_app_snapshot(&current_app_type);
+    data_cache.remove_usage_pricing_for_app(&current_app_type);
+
+    match data_cache.queue_current_app_data_refresh(app_data_req_tx, &current_app_type) {
+        AppDataLoadQueued::Queued | AppDataLoadQueued::AlreadyPending => Ok(()),
+        AppDataLoadQueued::Unavailable | AppDataLoadQueued::SendFailed => {
+            data_cache.remove_app_snapshot(&current_app_type);
+            *data = data::UiData::load(&current_app_type)?;
+            apply_loaded_data_cache_invalidation(
+                app,
+                data,
+                data_cache,
+                quota_req_tx,
+                usage_pricing_req_tx,
+                CacheInvalidation::DataReloaded,
+            )
+        }
+    }
 }
 
 fn handle_tui_action(
@@ -1631,6 +1786,7 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
                     &mut data,
                     &mut data_cache,
                     quota.as_ref().map(|s| &s.req_tx),
+                    usage_pricing.as_ref().map(|s| &s.req_tx),
                     msg,
                 );
             }

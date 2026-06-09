@@ -27,6 +27,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -873,6 +874,181 @@ def set_pty_size(fd: int, rows: int = 40, cols: int = 120) -> None:
         pass
 
 
+class TuiScreen:
+    """Small ANSI screen model for ratatui snapshots.
+
+    Ratatui redraws by moving the cursor around the alternate screen. A plain
+    stripped output buffer mixes old and new frames, so benchmark markers should
+    read a current screen snapshot instead.
+    """
+
+    def __init__(self, rows: int = 40, cols: int = 120) -> None:
+        self.rows = rows
+        self.cols = cols
+        self.saved_row = 0
+        self.saved_col = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self.row = 0
+        self.col = 0
+
+    def text(self) -> str:
+        return "\n".join("".join(row).rstrip() for row in self.grid)
+
+    def feed(self, data: str) -> None:
+        i = 0
+        while i < len(data):
+            ch = data[i]
+            if ch == "\x1b":
+                i = self._consume_escape(data, i)
+                continue
+            if ch == "\r":
+                self.col = 0
+            elif ch == "\n":
+                self._linefeed()
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+            elif ch == "\t":
+                self.col = min(self.cols - 1, ((self.col // 8) + 1) * 8)
+            elif ch >= " ":
+                self._put(ch)
+            i += 1
+
+    def _consume_escape(self, data: str, i: int) -> int:
+        if i + 1 >= len(data):
+            return i + 1
+        kind = data[i + 1]
+        if kind == "[":
+            j = i + 2
+            while j < len(data) and not ("@" <= data[j] <= "~"):
+                j += 1
+            if j < len(data):
+                self._handle_csi(data[i + 2 : j], data[j])
+                return j + 1
+            return len(data)
+        if kind == "]":
+            j = i + 2
+            while j < len(data):
+                if data[j] == "\x07":
+                    return j + 1
+                if data[j] == "\x1b" and j + 1 < len(data) and data[j + 1] == "\\":
+                    return j + 2
+                j += 1
+            return len(data)
+        if kind == "7":
+            self.saved_row, self.saved_col = self.row, self.col
+        elif kind == "8":
+            self.row, self.col = self.saved_row, self.saved_col
+        elif kind == "c":
+            self.reset()
+        return i + 2
+
+    def _params(self, raw: str) -> tuple[bool, list[int | None]]:
+        raw = raw.strip()
+        private = raw.startswith("?")
+        raw = raw.lstrip("?")
+        if not raw:
+            return private, []
+        params: list[int | None] = []
+        for part in raw.split(";"):
+            if not part:
+                params.append(None)
+                continue
+            match = re.match(r"\d+", part)
+            params.append(int(match.group(0)) if match else None)
+        return private, params
+
+    def _handle_csi(self, raw: str, final: str) -> None:
+        private, params = self._params(raw)
+        first = params[0] if params else None
+        n = first or 1
+
+        if final in ("H", "f"):
+            row = (params[0] if len(params) >= 1 and params[0] is not None else 1) - 1
+            col = (params[1] if len(params) >= 2 and params[1] is not None else 1) - 1
+            self.row = self._clamp(row, 0, self.rows - 1)
+            self.col = self._clamp(col, 0, self.cols - 1)
+        elif final == "A":
+            self.row = max(0, self.row - n)
+        elif final == "B":
+            self.row = min(self.rows - 1, self.row + n)
+        elif final == "C":
+            self.col = min(self.cols - 1, self.col + n)
+        elif final == "D":
+            self.col = max(0, self.col - n)
+        elif final == "E":
+            self.row = min(self.rows - 1, self.row + n)
+            self.col = 0
+        elif final == "F":
+            self.row = max(0, self.row - n)
+            self.col = 0
+        elif final == "G":
+            self.col = self._clamp(n - 1, 0, self.cols - 1)
+        elif final == "d":
+            self.row = self._clamp(n - 1, 0, self.rows - 1)
+        elif final == "J":
+            mode = first or 0
+            if mode in (2, 3):
+                self.reset()
+            elif mode == 0:
+                self._clear_to_screen_end()
+            elif mode == 1:
+                self._clear_to_screen_start()
+        elif final == "K":
+            mode = first or 0
+            if mode == 0:
+                self.grid[self.row][self.col :] = [" "] * (self.cols - self.col)
+            elif mode == 1:
+                self.grid[self.row][: self.col + 1] = [" "] * (self.col + 1)
+            elif mode == 2:
+                self.grid[self.row] = [" "] * self.cols
+        elif final == "s":
+            self.saved_row, self.saved_col = self.row, self.col
+        elif final == "u":
+            self.row, self.col = self.saved_row, self.saved_col
+        elif final in ("h", "l") and private and 1049 in [p for p in params if p is not None]:
+            self.reset()
+
+    def _clear_to_screen_end(self) -> None:
+        self.grid[self.row][self.col :] = [" "] * (self.cols - self.col)
+        for row in range(self.row + 1, self.rows):
+            self.grid[row] = [" "] * self.cols
+
+    def _clear_to_screen_start(self) -> None:
+        for row in range(0, self.row):
+            self.grid[row] = [" "] * self.cols
+        self.grid[self.row][: self.col + 1] = [" "] * (self.col + 1)
+
+    def _put(self, ch: str) -> None:
+        if self.col >= self.cols:
+            self._linefeed()
+            self.col = 0
+        width = self._char_width(ch)
+        self.grid[self.row][self.col] = ch
+        if width == 2 and self.col + 1 < self.cols:
+            self.grid[self.row][self.col + 1] = " "
+        self.col += width
+        if self.col >= self.cols:
+            self.col = self.cols - 1
+
+    def _linefeed(self) -> None:
+        if self.row >= self.rows - 1:
+            self.grid.pop(0)
+            self.grid.append([" "] * self.cols)
+        else:
+            self.row += 1
+
+    @staticmethod
+    def _char_width(ch: str) -> int:
+        return 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+
+    @staticmethod
+    def _clamp(value: int, low: int, high: int) -> int:
+        return max(low, min(high, value))
+
+
 class TuiSession:
     def __init__(self, args: list[str], timeout: float = 30.0) -> None:
         self.master, self.slave = pty.openpty()
@@ -888,6 +1064,7 @@ class TuiSession:
         self.proc = subprocess.Popen(args, stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, close_fds=True)
         os.close(self.slave)
         self.buffer = ""
+        self.screen_state = TuiScreen()
         self.timeout = timeout
 
     def send(self, data: bytes | str) -> None:
@@ -922,11 +1099,14 @@ class TuiSession:
         except OSError:
             return
         if chunk:
-            self.buffer += chunk.decode("utf-8", errors="replace")
+            decoded = chunk.decode("utf-8", errors="replace")
+            self.buffer += decoded
             self.buffer = self.buffer[-200000:]
+            self.screen_state.feed(decoded)
 
     def screen(self) -> str:
-        return strip_ansi(self.buffer)
+        screen = self.screen_state.text()
+        return screen if screen.strip() else strip_ansi(self.buffer)
 
     def wait_for(self, predicate: Callable[[str], bool], timeout: float | None = None) -> float:
         start = time.perf_counter()
@@ -1272,8 +1452,13 @@ def benchmark_tui(metrics: Metrics, binary: Path, paths: Paths, iterations: int,
             lambda s: "CC-Switch交互模式" in s or "CC-Switch Interactive" in s or "首页" in s or "Home" in s,
             timeout=timeout,
         )
-        time.sleep(0.45)
-        session.read_some(0.05)
+        current_name = bench_provider_name(app, "a")
+        session.wait_for(
+            lambda s: current_name in s
+            or current_name.replace(" ", "") in s
+            or f"{BENCH}-{app}-a" in s,
+            timeout=timeout,
+        )
         return session, (time.perf_counter() - start) * 1000
 
     def run_tui_op(app: str, operation: str, record: bool, body: Callable[[TuiSession], float | None]) -> None:
