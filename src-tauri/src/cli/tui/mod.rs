@@ -1064,6 +1064,7 @@ fn cache_invalidation_for_action(action: &Action) -> CacheInvalidation {
         | Action::HermesMemoryOpen { .. }
         | Action::SetSkipClaudeOnboarding { .. }
         | Action::SetClaudePluginIntegration { .. }
+        | Action::SetCodexUnifiedSessionHistory { .. }
         | Action::SetManagedProxyForCurrentApp { .. }
         | Action::SetLanguage(_)
         | Action::CheckUpdate

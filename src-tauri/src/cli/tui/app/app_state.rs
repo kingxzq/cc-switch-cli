@@ -249,6 +249,9 @@ pub enum Action {
     SetClaudePluginIntegration {
         enabled: bool,
     },
+    SetCodexUnifiedSessionHistory {
+        enabled: bool,
+    },
     #[allow(dead_code)]
     SetProxyEnabled {
         enabled: bool,
@@ -444,12 +447,13 @@ pub enum SettingsItem {
     ManagedAccounts,
     SkipClaudeOnboarding,
     ClaudePluginIntegration,
+    CodexUnifiedSessionHistory,
     Proxy,
     CheckForUpdates,
 }
 
 impl SettingsItem {
-    pub const ALL: [SettingsItem; 9] = [
+    pub const ALL: [SettingsItem; 10] = [
         SettingsItem::ManagedAccounts,
         SettingsItem::Language,
         SettingsItem::VisibleAppsMode,
@@ -457,6 +461,7 @@ impl SettingsItem {
         SettingsItem::OpenClawConfigDir,
         SettingsItem::SkipClaudeOnboarding,
         SettingsItem::ClaudePluginIntegration,
+        SettingsItem::CodexUnifiedSessionHistory,
         SettingsItem::Proxy,
         SettingsItem::CheckForUpdates,
     ];
