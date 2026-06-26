@@ -6,12 +6,12 @@
 //!
 //! Follows the [`super::providers`] template.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use super::common::{block_on, opt_str_arg, to_value};
+use super::common::{block_on, opt_str_arg, str_arg, to_value};
 use crate::services::CodexOAuthService;
 use crate::web::error::WebError;
-use crate::AppState;
+use crate::{AppState, ProviderService};
 
 pub fn dispatch(_state: &AppState, command: &str, args: &Value) -> Option<Result<Value, WebError>> {
     Some(match command {
@@ -25,9 +25,26 @@ pub fn dispatch(_state: &AppState, command: &str, args: &Value) -> Option<Result
                 .and_then(to_value)
         }
 
-        // `fetch_models_for_config` is intentionally NOT wired here: there is no
-        // cc-switch-cli domain fn matching its contract (baseUrl/apiKey/isFullUrl/
-        // modelsUrl/customUserAgent -> Vec<FetchedModel>). It falls through to 501.
+        // OpenAI-compatible GET /v1/models fetch. ProviderService::fetch_provider_models
+        // is async -> Result<Vec<String>> (model ids). The extra TS args
+        // (isFullUrl/modelsUrl/customUserAgent) aren't supported by the CLI impl
+        // and are ignored. Reshape ids into the TS FetchedModel[] contract.
+        "fetch_models_for_config" => match str_arg(args, "baseUrl") {
+            Ok(base_url) => block_on(ProviderService::fetch_provider_models(
+                base_url,
+                opt_str_arg(args, "apiKey"),
+            ))
+            .map_err(WebError::Domain)
+            .map(|ids| {
+                Value::Array(
+                    ids.into_iter()
+                        .map(|id| json!({ "id": id, "ownedBy": Value::Null }))
+                        .collect(),
+                )
+            }),
+            Err(e) => Err(e),
+        },
+
         _ => return None,
     })
 }
