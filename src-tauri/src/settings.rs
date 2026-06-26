@@ -410,6 +410,9 @@ pub struct AppSettings {
     /// 是否已确认用量查询首次提示
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_confirmed: Option<bool>,
+    /// 是否已确认首次运行欢迎提示（Web 控制台与桌面端共用此标志）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_run_notice_confirmed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_config_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,6 +498,7 @@ impl Default for AppSettings {
             skip_claude_onboarding: false,
             common_config_confirmed: None,
             usage_confirmed: None,
+            first_run_notice_confirmed: None,
             claude_config_dir: None,
             codex_config_dir: None,
             gemini_config_dir: None,

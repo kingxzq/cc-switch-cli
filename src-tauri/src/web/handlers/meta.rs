@@ -70,6 +70,15 @@ pub fn dispatch(state: &AppState, command: &str, args: &Value) -> Option<Result<
         // harmless if ever called.
         "get_app_version" => Ok(Value::String(env!("CARGO_PKG_VERSION").to_string())),
 
+        // ─── Startup status (keep the SPA boot sequence clean) ───
+        // The app polls these on launch; returning real/benign values instead
+        // of 501 avoids the noisy console errors and lets the UI settle.
+        "get_init_error" => to_value(crate::init_status::get_init_error()),
+        "get_migration_result" => Ok(Value::Bool(false)),
+        "get_skills_migration_result" => Ok(Value::Bool(false)),
+        // Desktop-only native window theming — no-op in the browser.
+        "set_window_theme" => Ok(Value::Null),
+
         _ => return None,
     })
 }
