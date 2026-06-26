@@ -364,7 +364,9 @@ fn data_version_changes_only_on_external_commit() {
         .expect("write via the other connection");
     assert_ne!(
         v0,
-        reader.data_version().expect("read data_version after commit"),
+        reader
+            .data_version()
+            .expect("read data_version after commit"),
         "data_version must change after an external commit"
     );
 }
