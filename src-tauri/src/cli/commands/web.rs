@@ -137,6 +137,9 @@ fn serve_web(
             info(crate::t!("Press Ctrl-C to stop.", "按 Ctrl-C 停止。"))
         );
 
+        // Live refresh: push external DB changes (e.g. from the TUI) to browsers.
+        web::sync::spawn_db_change_watcher(web_state.clone());
+
         let app = web::build_router(web_state, assets);
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(async {

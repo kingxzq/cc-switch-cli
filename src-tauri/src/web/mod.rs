@@ -15,6 +15,7 @@ pub mod events;
 pub mod handlers;
 pub mod server;
 pub mod state;
+pub mod sync;
 pub mod tunnel;
 
 pub use server::build_router;

@@ -533,6 +533,17 @@ impl Database {
         Ok(count == 0)
     }
 
+    /// SQLite `PRAGMA data_version` — a per-connection counter that changes only
+    /// when **another** connection (this or another process) has committed since
+    /// the last read; commits on this connection never bump it. This makes it a
+    /// cheap, self-quiescing signal for "the DB was changed externally", used to
+    /// drive live cross-process refresh (web ↔ TUI) without IPC.
+    pub fn data_version(&self) -> Result<i64, AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     pub(crate) fn runtime_key(&self) -> &str {
         &self.runtime_key
     }

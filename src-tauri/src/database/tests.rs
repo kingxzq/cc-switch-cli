@@ -341,6 +341,35 @@ fn readonly_snapshot_opens_current_schema_without_allowing_writes() {
 }
 
 #[test]
+#[serial_test::serial]
+fn data_version_changes_only_on_external_commit() {
+    let _lock = crate::test_support::lock_test_home_and_settings();
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let _guard = ConfigDirEnvGuard::set(temp.path());
+
+    let writer = Database::init().expect("init writer db");
+    let reader = Database::open_readonly_current_schema().expect("open reader snapshot");
+
+    let v0 = reader.data_version().expect("read data_version");
+    // Re-reading without any external write keeps the same value.
+    assert_eq!(
+        v0,
+        reader.data_version().expect("read data_version again"),
+        "data_version must be stable without external writes"
+    );
+
+    // A commit from another connection must bump the reader's view.
+    writer
+        .set_setting("dv_probe", "1")
+        .expect("write via the other connection");
+    assert_ne!(
+        v0,
+        reader.data_version().expect("read data_version after commit"),
+        "data_version must change after an external commit"
+    );
+}
+
+#[test]
 fn schema_migration_adds_missing_columns_for_providers() {
     let conn = Connection::open_in_memory().expect("open memory db");
 

@@ -1240,6 +1240,47 @@ fn apply_cache_invalidation(
     )
 }
 
+/// Live cross-process refresh. If another process (e.g. `cc-switch web serve`)
+/// committed to the shared SQLite DB since the last poll, reload everything
+/// fresh via the same path DB-replacing operations use
+/// (`CacheInvalidation::AppStateRecreated`). Skipped while an overlay is open so
+/// the user isn't interrupted mid-interaction. `last_version` is seeded with the
+/// startup value, so this fires only on a genuine external change.
+#[allow(clippy::too_many_arguments)]
+fn poll_external_db_change(
+    app: &mut App,
+    data: &mut data::UiData,
+    data_cache: &mut UiDataByAppCache,
+    quota_req_tx: Option<&mpsc::Sender<QuotaReq>>,
+    app_data_req_tx: Option<&mpsc::Sender<AppDataReq>>,
+    usage_pricing_req_tx: Option<&mpsc::Sender<UsagePricingReq>>,
+    probe: Option<&crate::Database>,
+    last_version: &mut Option<i64>,
+) {
+    if !matches!(app.overlay, Overlay::None) {
+        return;
+    }
+    let Some(probe) = probe else { return };
+    let Ok(version) = probe.data_version() else {
+        return;
+    };
+    if *last_version == Some(version) {
+        return;
+    }
+    *last_version = Some(version);
+    if let Err(err) = apply_cache_invalidation(
+        app,
+        data,
+        data_cache,
+        quota_req_tx,
+        app_data_req_tx,
+        usage_pricing_req_tx,
+        CacheInvalidation::AppStateRecreated,
+    ) {
+        log::debug!("external DB change reload failed: {err}");
+    }
+}
+
 fn apply_loaded_data_cache_invalidation(
     app: &mut App,
     data: &mut data::UiData,
@@ -1528,6 +1569,11 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
     let (mut app, mut data) =
         initialize_app_shell_with(app_override, apply_visible_apps_startup_policy)?;
     let mut startup_overlay = (!matches!(app.overlay, Overlay::None)).then(|| app.overlay.clone());
+
+    // Read-only probe for live cross-process refresh (PRAGMA data_version). Seed
+    // with the current value so we react only to *later* external changes.
+    let version_probe = crate::Database::open_readonly_current_schema().ok();
+    let mut last_data_version = version_probe.as_ref().and_then(|db| db.data_version().ok());
 
     let tick_rate = TUI_TICK_RATE;
     let mut last_tick = Instant::now();
@@ -2128,6 +2174,16 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
                 &mut app,
                 &mut data,
                 quota.as_ref().map(|s| &s.req_tx),
+            );
+            poll_external_db_change(
+                &mut app,
+                &mut data,
+                &mut data_cache,
+                quota.as_ref().map(|s| &s.req_tx),
+                app_data.as_ref().map(|s| &s.req_tx),
+                usage_pricing.as_ref().map(|s| &s.req_tx),
+                version_probe.as_ref(),
+                &mut last_data_version,
             );
             last_tick = Instant::now();
         }
