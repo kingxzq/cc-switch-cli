@@ -12,6 +12,7 @@ pub mod assets;
 pub mod dispatch;
 pub mod error;
 pub mod events;
+pub mod handlers;
 pub mod server;
 pub mod state;
 

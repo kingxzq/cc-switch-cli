@@ -147,3 +147,36 @@ async fn web_bridge_switch_provider_round_trips() {
 
     server.abort();
 }
+
+/// Exercises the async dispatch path: `get_proxy_status` calls an async
+/// `ProxyService` fn via `common::block_on` (block_in_place), which requires a
+/// multi-threaded runtime — hence the `flavor = "multi_thread"`. Also spot-checks
+/// a few read-only commands across modules resolve through the dispatch chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn web_bridge_handles_async_and_cross_module_commands() {
+    let _guard = lock_test_mutex();
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let (base, server) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    for cmd in [
+        "get_proxy_status",      // async (block_on) — proxy module
+        "get_settings",          // sync — meta module
+        "get_usage_summary",     // sync — usage module
+        "get_claude_mcp_status", // sync — mcp_config module
+    ] {
+        let res = client
+            .post(format!("{base}/api/invoke/{cmd}"))
+            .header("x-cc-switch-token", TOKEN)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{cmd} request failed: {e}"));
+        assert_eq!(res.status(), 200, "{cmd} should return 200");
+    }
+
+    server.abort();
+}
