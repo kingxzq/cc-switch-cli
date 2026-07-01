@@ -958,6 +958,7 @@ mod tests {
         match cli.command {
             Some(Commands::Provider(super::commands::provider::ProviderCommand::Add {
                 template,
+                ..
             })) => {
                 assert_eq!(
                     template,

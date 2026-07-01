@@ -4,12 +4,14 @@ use std::{collections::HashSet, path::PathBuf};
 use super::{provider_inspect, provider_usage_query};
 use crate::app_config::AppType;
 use crate::cli::commands::provider_input::{
-    build_provider_from_add_template, common_snippet_has_effective_config, current_timestamp,
-    display_provider_summary, prompt_basic_fields, prompt_optional_fields,
-    prompt_provider_id_for_add, prompt_settings_config, prompt_settings_config_for_add,
-    provider_add_template_choices, provider_uses_common_config, set_provider_common_config_meta,
-    supports_common_config, validate_provider_add_template, OptionalFields, ProviderAddTemplate,
-    SettingsConfigPromptResult,
+    build_claude_settings_config_from_prompt, build_codex_settings_config_from_prompt,
+    build_gemini_api_key_settings_config, build_gemini_oauth_settings_config,
+    build_provider_from_add_template, codex_current_base_url_model,
+    common_snippet_has_effective_config, current_timestamp, display_provider_summary,
+    generate_provider_id_for_app, prompt_basic_fields, prompt_optional_fields,
+    prompt_settings_config, provider_uses_common_config, set_provider_common_config_meta,
+    supports_common_config, validate_provider_add_template, validate_provider_id_for_add,
+    OptionalFields, ProviderAddTemplate, SettingsConfigPromptResult,
 };
 use crate::cli::i18n::texts;
 use crate::cli::ui::{highlight, info, success, warning};
@@ -521,6 +523,24 @@ fn prompt_common_config_enabled(
     Ok(Some(enabled))
 }
 
+/// Claude API-key environment variable to populate (`provider add`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ClaudeApiKeyFieldArg {
+    /// Use ANTHROPIC_AUTH_TOKEN (default)
+    AuthToken,
+    /// Use ANTHROPIC_API_KEY
+    ApiKey,
+}
+
+impl From<ClaudeApiKeyFieldArg> for ClaudeApiKeyField {
+    fn from(value: ClaudeApiKeyFieldArg) -> Self {
+        match value {
+            ClaudeApiKeyFieldArg::AuthToken => ClaudeApiKeyField::AuthToken,
+            ClaudeApiKeyFieldArg::ApiKey => ClaudeApiKeyField::ApiKey,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ProviderCommand {
     /// List all providers
@@ -532,11 +552,56 @@ pub enum ProviderCommand {
         /// Provider ID to switch to
         id: String,
     },
-    /// Add a new provider
+    /// Add a new provider (non-interactive; use the TUI for interactive add)
     Add {
         /// Provider template to apply before creation
         #[arg(long, value_enum)]
         template: Option<ProviderAddTemplate>,
+        /// Provider display name (required)
+        #[arg(long)]
+        name: Option<String>,
+        /// Explicit provider ID (default: generated from the name)
+        #[arg(long)]
+        id: Option<String>,
+        /// API endpoint base URL (Claude/Codex/Gemini field mode)
+        #[arg(long, conflicts_with_all = ["config", "config_file"])]
+        base_url: Option<String>,
+        /// API key or token (Claude/Codex/Gemini field mode)
+        #[arg(long, conflicts_with_all = ["config", "config_file"])]
+        api_key: Option<String>,
+        /// Default model (Claude/Codex/Gemini field mode, optional)
+        #[arg(long, conflicts_with_all = ["config", "config_file"])]
+        model: Option<String>,
+        /// Raw settings_config as a JSON string (any app, advanced use)
+        #[arg(long, conflicts_with = "config_file")]
+        config: Option<String>,
+        /// Raw settings_config read from a JSON file (any app, advanced use)
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        /// Website URL (optional)
+        #[arg(long)]
+        website_url: Option<String>,
+        /// Notes (optional)
+        #[arg(long)]
+        notes: Option<String>,
+        /// Sort index (optional)
+        #[arg(long)]
+        sort_index: Option<usize>,
+        /// Claude API-key field to populate (default: auth-token)
+        #[arg(long, value_enum)]
+        api_key_field: Option<ClaudeApiKeyFieldArg>,
+        /// Provider API format (Claude: anthropic|openai_chat|openai_responses|gemini_native; Codex: responses|chat)
+        #[arg(long)]
+        api_format: Option<String>,
+        /// Attach the app-level common config snippet (Claude/Codex/Gemini)
+        #[arg(long)]
+        common_config: bool,
+        /// Codex OAuth managed account ID (required for the codex-oauth template)
+        #[arg(long)]
+        account_id: Option<String>,
+        /// Enable Codex fast mode (codex-oauth template)
+        #[arg(long)]
+        fast_mode: bool,
     },
     /// Edit a provider
     Edit {
@@ -625,7 +690,44 @@ pub fn execute(cmd: ProviderCommand, app: Option<AppType>) -> Result<(), AppErro
         ProviderCommand::List => provider_inspect::list_providers(app_type),
         ProviderCommand::Current => provider_inspect::show_current(app_type),
         ProviderCommand::Switch { id } => switch_provider(app_type, &id),
-        ProviderCommand::Add { template } => add_provider(app_type, template),
+        ProviderCommand::Add {
+            template,
+            name,
+            id,
+            base_url,
+            api_key,
+            model,
+            config,
+            config_file,
+            website_url,
+            notes,
+            sort_index,
+            api_key_field,
+            api_format,
+            common_config,
+            account_id,
+            fast_mode,
+        } => add_provider(
+            app_type,
+            AddProviderArgs {
+                template,
+                name,
+                id,
+                base_url,
+                api_key,
+                model,
+                config,
+                config_file,
+                website_url,
+                notes,
+                sort_index,
+                api_key_field: api_key_field.map(ClaudeApiKeyField::from),
+                api_format,
+                common_config,
+                account_id,
+                fast_mode,
+            },
+        ),
         ProviderCommand::Edit { id } => edit_provider(app_type, &id),
         ProviderCommand::Delete { id } => delete_provider(app_type, &id),
         ProviderCommand::Duplicate { id, edit } => duplicate_provider(app_type, &id, edit),
@@ -797,42 +899,363 @@ fn delete_provider(app_type: AppType, id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn prompt_provider_add_template(
-    app_type: &AppType,
-) -> Result<Option<ProviderAddTemplate>, AppError> {
-    let choices = provider_add_template_choices(app_type);
-    if choices.is_empty() {
-        return Ok(Some(ProviderAddTemplate::Custom));
-    }
+/// Parsed flags for the non-interactive `provider add`.
+struct AddProviderArgs {
+    template: Option<ProviderAddTemplate>,
+    name: Option<String>,
+    id: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    config: Option<String>,
+    config_file: Option<PathBuf>,
+    website_url: Option<String>,
+    notes: Option<String>,
+    sort_index: Option<usize>,
+    api_key_field: Option<ClaudeApiKeyField>,
+    api_format: Option<String>,
+    common_config: bool,
+    account_id: Option<String>,
+    fast_mode: bool,
+}
 
-    let labels = choices
-        .iter()
-        .map(|choice| choice.label.to_string())
-        .collect::<Vec<_>>();
-    match Select::new(texts::select_provider_add_mode(), labels.clone()).prompt() {
-        Ok(selected) => {
-            let template = choices
-                .iter()
-                .find(|choice| choice.label == selected)
-                .map(|choice| choice.template)
-                .unwrap_or(ProviderAddTemplate::Custom);
-            Ok(Some(template))
-        }
-        Err(inquire::error::InquireError::OperationCanceled)
-        | Err(inquire::error::InquireError::OperationInterrupted) => {
-            println!("{}", info(texts::cancelled()));
-            Ok(None)
-        }
-        Err(e) => Err(AppError::Message(texts::input_failed_error(&e.to_string()))),
+/// Trim a flag value and drop it when empty.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn add_requires_name_error() -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        "provider add 需要 --name 参数；如需交互式添加，请运行 TUI（cc-switch）".to_string()
+    } else {
+        "provider add requires --name; run the TUI (cc-switch) for interactive add".to_string()
+    })
+}
+
+fn add_missing_field_error(flag: &str) -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        format!("非交互式 provider add 缺少必填参数 {flag}")
+    } else {
+        format!("non-interactive provider add is missing required flag {flag}")
+    })
+}
+
+fn add_additive_requires_config_error(app_type: &AppType) -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        format!(
+            "应用 {} 的 provider add 需要通过 --config 或 --config-file 提供原始配置（或使用 TUI）",
+            app_type.as_str()
+        )
+    } else {
+        format!(
+            "provider add for {} requires raw config via --config or --config-file (or use the TUI)",
+            app_type.as_str()
+        )
+    })
+}
+
+fn add_template_rejects_config_error(template: ProviderAddTemplate) -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        format!(
+            "模板 '{}' 不接受 --base-url/--api-key/--model/--config 等配置参数",
+            template.cli_name()
+        )
+    } else {
+        format!(
+            "template '{}' does not accept --base-url/--api-key/--model/--config overrides",
+            template.cli_name()
+        )
+    })
+}
+
+fn codex_oauth_requires_account_error() -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        "codex-oauth 模板需要 --account-id（请先运行 `cc-switch auth login`）".to_string()
+    } else {
+        "the codex-oauth template requires --account-id (run `cc-switch auth login` first)"
+            .to_string()
+    })
+}
+
+fn codex_oauth_account_not_found_error(
+    account_id: &str,
+    accounts: &[ManagedAuthAccount],
+) -> AppError {
+    let available = if accounts.is_empty() {
+        "(none)".to_string()
+    } else {
+        accounts
+            .iter()
+            .map(codex_oauth_account_label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        format!("未找到 codex-oauth 账号 '{account_id}'。可用账号：{available}")
+    } else {
+        format!("codex-oauth account '{account_id}' not found. Available accounts: {available}")
+    })
+}
+
+fn common_config_unavailable_message(app_type: &AppType) -> String {
+    if crate::cli::i18n::is_chinese() {
+        format!(
+            "应用 {} 未配置公共配置片段，已忽略 --common-config",
+            app_type.as_str()
+        )
+    } else {
+        format!(
+            "no common config snippet configured for {}; --common-config ignored",
+            app_type.as_str()
+        )
     }
 }
 
-fn add_provider(app_type: AppType, template: Option<ProviderAddTemplate>) -> Result<(), AppError> {
-    // Disable bracketed paste mode to work around inquire dropping paste events
-    crate::cli::terminal::disable_bracketed_paste_mode_best_effort();
+/// Read the raw `settings_config` JSON from `--config` or `--config-file`.
+fn load_raw_settings_config(args: &AddProviderArgs) -> Result<Option<serde_json::Value>, AppError> {
+    let raw = if let Some(text) = args.config.as_deref() {
+        text.to_string()
+    } else if let Some(path) = args.config_file.as_deref() {
+        std::fs::read_to_string(path).map_err(|e| {
+            AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+                format!("无法读取配置文件 {}: {e}", path.display())
+            } else {
+                format!("failed to read config file {}: {e}", path.display())
+            })
+        })?
+    } else {
+        return Ok(None);
+    };
 
-    println!("{}", highlight("Add New Provider"));
-    println!("{}", "=".repeat(50));
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+        AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+            format!("配置 JSON 解析失败: {e}")
+        } else {
+            format!("failed to parse config JSON: {e}")
+        })
+    })?;
+    Ok(Some(value))
+}
+
+fn resolve_add_provider_id(
+    app_type: &AppType,
+    explicit: Option<&str>,
+    name: &str,
+    existing_ids: &[String],
+) -> Result<String, AppError> {
+    match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            validate_provider_id_for_add(app_type, id, existing_ids)?;
+            Ok(id.to_string())
+        }
+        None => Ok(generate_provider_id_for_app(app_type, name, existing_ids)),
+    }
+}
+
+fn claude_current_base_url(current: Option<&serde_json::Value>) -> Option<String> {
+    current
+        .and_then(|v| v.get("env"))
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|u| u.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn gemini_current_env(current: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    let env = current.and_then(|v| v.get("env"))?;
+    keys.iter().find_map(|key| {
+        env.get(*key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Build a provider's `settings_config` from CLI flags (raw or field mode).
+fn build_add_settings_config(
+    app_type: &AppType,
+    args: &AddProviderArgs,
+    raw_config: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
+    prompt_result: &mut Option<SettingsConfigPromptResult>,
+) -> Result<serde_json::Value, AppError> {
+    // Raw config wins for every app type.
+    if let Some(raw) = raw_config {
+        if matches!(app_type, AppType::Claude) {
+            let field = args
+                .api_key_field
+                .unwrap_or_else(|| ClaudeApiKeyField::from_meta_and_settings(None, raw));
+            *prompt_result = Some(SettingsConfigPromptResult {
+                settings_config: raw.clone(),
+                claude_api_key_field: Some(field),
+            });
+        }
+        return Ok(raw.clone());
+    }
+
+    match app_type {
+        AppType::Claude => {
+            let base_url = non_empty(args.base_url.clone())
+                .or_else(|| claude_current_base_url(current))
+                .ok_or_else(|| add_missing_field_error("--base-url"))?;
+            let api_key = non_empty(args.api_key.clone())
+                .ok_or_else(|| add_missing_field_error("--api-key"))?;
+            let field = args.api_key_field.unwrap_or(ClaudeApiKeyField::AuthToken);
+            let model_fields = vec![("ANTHROPIC_MODEL", non_empty(args.model.clone()))];
+            let settings = build_claude_settings_config_from_prompt(
+                current,
+                field,
+                &api_key,
+                &base_url,
+                model_fields,
+                false,
+            );
+            *prompt_result = Some(SettingsConfigPromptResult {
+                settings_config: settings.clone(),
+                claude_api_key_field: Some(field),
+            });
+            Ok(settings)
+        }
+        AppType::Codex => {
+            let (cur_base, cur_model) = codex_current_base_url_model(current);
+            let base_url = non_empty(args.base_url.clone())
+                .or(cur_base)
+                .ok_or_else(|| add_missing_field_error("--base-url"))?;
+            let api_key = non_empty(args.api_key.clone())
+                .ok_or_else(|| add_missing_field_error("--api-key"))?;
+            let model = non_empty(args.model.clone())
+                .or(cur_model)
+                .unwrap_or_default();
+            Ok(build_codex_settings_config_from_prompt(
+                current,
+                &api_key,
+                &base_url,
+                model.trim(),
+                "custom",
+            ))
+        }
+        AppType::Gemini => match non_empty(args.api_key.clone()) {
+            Some(api_key) => {
+                let base_url = non_empty(args.base_url.clone())
+                    .or_else(|| {
+                        gemini_current_env(current, &["GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL"])
+                    })
+                    .unwrap_or_default();
+                let model = non_empty(args.model.clone())
+                    .or_else(|| gemini_current_env(current, &["GEMINI_MODEL"]))
+                    .unwrap_or_default();
+                Ok(build_gemini_api_key_settings_config(
+                    current, &api_key, &base_url, &model,
+                ))
+            }
+            None => Ok(build_gemini_oauth_settings_config(current)),
+        },
+        AppType::OpenCode | AppType::Hermes | AppType::OpenClaw => {
+            Err(add_additive_requires_config_error(app_type))
+        }
+    }
+}
+
+fn add_invalid_api_format_error(raw: &str, choices: &str) -> AppError {
+    AppError::InvalidInput(if crate::cli::i18n::is_chinese() {
+        format!("无效的 API 格式 '{raw}'。可用值：{choices}")
+    } else {
+        format!("invalid API format '{raw}'. Valid values: {choices}")
+    })
+}
+
+fn validate_claude_api_format(raw: &str) -> Result<&'static str, AppError> {
+    match raw.trim() {
+        CLAUDE_API_FORMAT_ANTHROPIC => Ok(CLAUDE_API_FORMAT_ANTHROPIC),
+        CLAUDE_API_FORMAT_OPENAI_CHAT => Ok(CLAUDE_API_FORMAT_OPENAI_CHAT),
+        CLAUDE_API_FORMAT_OPENAI_RESPONSES => Ok(CLAUDE_API_FORMAT_OPENAI_RESPONSES),
+        CLAUDE_API_FORMAT_GEMINI_NATIVE => Ok(CLAUDE_API_FORMAT_GEMINI_NATIVE),
+        other => Err(add_invalid_api_format_error(
+            other,
+            "anthropic, openai_chat, openai_responses, gemini_native",
+        )),
+    }
+}
+
+fn validate_codex_api_format(raw: &str) -> Result<&'static str, AppError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "chat"
+        | "chat_completions"
+        | "chat-completions"
+        | "openai_chat"
+        | "openai-chat"
+        | "openai_chat_completions" => Ok(CLAUDE_API_FORMAT_OPENAI_CHAT),
+        "responses" | "openai_responses" | "openai-responses" => {
+            Ok(CLAUDE_API_FORMAT_OPENAI_RESPONSES)
+        }
+        other => Err(add_invalid_api_format_error(other, "responses, chat")),
+    }
+}
+
+/// Apply the provider API format for `provider add`. When `--api-format` is
+/// omitted the provider's effective/existing format is preserved (template
+/// seeds, raw-config meta) rather than being reset to a hard-coded default.
+fn apply_add_provider_api_format(
+    app_type: &AppType,
+    provider: &mut Provider,
+    api_format: Option<&str>,
+) -> Result<(), AppError> {
+    match app_type {
+        AppType::Claude => {
+            if apply_fixed_claude_api_format_if_needed(app_type, provider) {
+                return Ok(());
+            }
+            let format = match api_format {
+                Some(raw) => validate_claude_api_format(raw)?,
+                None => effective_claude_api_format(provider),
+            };
+            apply_claude_api_format(provider, format);
+        }
+        AppType::Codex => {
+            if apply_fixed_codex_api_format_if_needed(app_type, provider) {
+                return Ok(());
+            }
+            let format = match api_format {
+                Some(raw) => validate_codex_api_format(raw)?,
+                None => effective_codex_api_format(provider),
+            };
+            apply_codex_api_format(provider, format);
+        }
+        AppType::Gemini | AppType::OpenCode | AppType::Hermes | AppType::OpenClaw => {}
+    }
+    Ok(())
+}
+
+/// Apply codex-oauth options non-interactively. Unlike the interactive flow,
+/// the managed account must be specified explicitly via `--account-id`.
+fn apply_add_codex_oauth_options(
+    app_type: &AppType,
+    provider: &mut Provider,
+    account_id: Option<&str>,
+    fast_mode: bool,
+) -> Result<(), AppError> {
+    if !matches!(app_type, AppType::Claude) || !is_claude_codex_oauth_provider(provider) {
+        return Ok(());
+    }
+
+    let account_id = account_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(codex_oauth_requires_account_error)?;
+    let accounts = load_codex_oauth_accounts()?;
+    if !accounts.iter().any(|account| account.id == account_id) {
+        return Err(codex_oauth_account_not_found_error(account_id, &accounts));
+    }
+    apply_codex_oauth_provider_options(provider, Some(account_id.to_string()), fast_mode);
+    Ok(())
+}
+
+fn add_provider(app_type: AppType, args: AddProviderArgs) -> Result<(), AppError> {
+    let name = non_empty(args.name.clone()).ok_or_else(add_requires_name_error)?;
 
     // 1. 加载配置和状态
     let state = AppState::try_new()?;
@@ -844,32 +1267,27 @@ fn add_provider(app_type: AppType, template: Option<ProviderAddTemplate>) -> Res
     let common_snippet = config.common_config_snippets.get(&app_type).cloned();
     drop(config);
 
-    let template = match template {
-        Some(template) => {
-            validate_provider_add_template(&app_type, template)?;
-            template
-        }
-        None => match prompt_provider_add_template(&app_type)? {
-            Some(template) => template,
-            None => return Ok(()),
-        },
-    };
+    let template = args.template.unwrap_or(ProviderAddTemplate::Custom);
+    validate_provider_add_template(&app_type, template)?;
 
-    // 2. 收集基本字段
-    let mut settings_prompt_result = None;
+    let raw_config = load_raw_settings_config(&args)?;
+    let mut settings_prompt_result: Option<SettingsConfigPromptResult> = None;
+
+    // 2. 构造供应商（自定义或基于模板）
     let mut provider = if template.is_custom() {
-        let (name, website_url) = prompt_basic_fields(None)?;
-        let id = prompt_provider_id_for_add(&app_type, &name, &existing_ids)?;
-        println!("{}", info(&texts::generated_id_message(&id)));
-
-        let prompt_result = prompt_settings_config_for_add(&app_type)?;
-        let settings_config = prompt_result.settings_config.clone();
-        settings_prompt_result = Some(prompt_result);
+        let id = resolve_add_provider_id(&app_type, args.id.as_deref(), &name, &existing_ids)?;
+        let settings_config = build_add_settings_config(
+            &app_type,
+            &args,
+            raw_config.as_ref(),
+            None,
+            &mut settings_prompt_result,
+        )?;
         Provider {
             id,
             name,
             settings_config,
-            website_url,
+            website_url: non_empty(args.website_url.clone()),
             category: None,
             created_at: Some(current_timestamp()),
             sort_index: None,
@@ -881,65 +1299,70 @@ fn add_provider(app_type: AppType, template: Option<ProviderAddTemplate>) -> Res
         }
     } else {
         let mut provider = build_provider_from_add_template(&app_type, template, &existing_ids)?;
-        if matches!(app_type, AppType::Hermes | AppType::OpenClaw) {
-            provider.id = prompt_provider_id_for_add(&app_type, &provider.name, &existing_ids)?;
+        provider.name = name.clone();
+        provider.id = resolve_add_provider_id(&app_type, args.id.as_deref(), &name, &existing_ids)?;
+        if let Some(url) = non_empty(args.website_url.clone()) {
+            provider.website_url = Some(url);
         }
+
+        let has_field_input = raw_config.is_some()
+            || args.base_url.is_some()
+            || args.api_key.is_some()
+            || args.model.is_some();
         if template.requires_settings_prompt() {
-            let prompt_result = prompt_settings_config(
+            // Sponsor / third-party templates: fold the CLI field values into the
+            // template's prefilled settings_config (base_url is inherited when
+            // --base-url is omitted).
+            let current = provider.settings_config.clone();
+            provider.settings_config = build_add_settings_config(
                 &app_type,
-                Some(&provider.settings_config),
-                provider.meta.as_ref(),
-                provider.is_codex_official(),
+                &args,
+                raw_config.as_ref(),
+                Some(&current),
+                &mut settings_prompt_result,
             )?;
-            provider.settings_config = prompt_result.settings_config.clone();
-            settings_prompt_result = Some(prompt_result);
+        } else if has_field_input {
+            // Official / OAuth templates are self-contained; rebuilding their
+            // settings from field flags would leave inconsistent official
+            // metadata behind, so reject the overrides outright.
+            return Err(add_template_rejects_config_error(template));
         }
-        println!("{}", info(&texts::generated_id_message(&provider.id)));
         provider
     };
 
-    // 4. 询问是否配置可选字段
-    let optional = if Confirm::new(texts::configure_optional_fields_prompt())
-        .with_default(false)
-        .prompt()
-        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
-    {
-        prompt_optional_fields(None)?
-    } else {
-        OptionalFields::default()
-    };
-
-    // 5. 应用可选字段与共享元数据
-    provider.sort_index = optional.sort_index;
-    provider.notes = optional.notes;
+    // 3. 应用可选字段与共享元数据
+    provider.sort_index = args.sort_index;
+    provider.notes = non_empty(args.notes.clone());
     apply_settings_prompt_result_metadata(
         &app_type,
         &mut provider,
         settings_prompt_result.as_ref(),
     );
-    prompt_and_apply_provider_api_format(&app_type, &mut provider)?;
-    prompt_and_apply_codex_oauth_provider_options(&app_type, &mut provider)?;
-    if let Some(enabled) = prompt_common_config_enabled(&app_type, common_snippet.as_deref(), None)?
+    apply_add_provider_api_format(
+        &app_type,
+        &mut provider,
+        non_empty(args.api_format.clone()).as_deref(),
+    )?;
+    apply_add_codex_oauth_options(
+        &app_type,
+        &mut provider,
+        args.account_id.as_deref(),
+        args.fast_mode,
+    )?;
+
+    if supports_common_config(&app_type)
+        && common_snippet_has_effective_config(&app_type, common_snippet.as_deref())
     {
-        set_provider_common_config_meta(&mut provider, enabled);
+        set_provider_common_config_meta(&mut provider, args.common_config);
+    } else if args.common_config {
+        println!("{}", warning(&common_config_unavailable_message(&app_type)));
     }
 
-    // 6. 显示摘要并确认
+    // 4. 显示摘要并写入
     display_provider_summary(&provider, &app_type);
-    if !Confirm::new(&texts::confirm_create_entity(texts::entity_provider()))
-        .with_default(false)
-        .prompt()
-        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?
-    {
-        println!("{}", info(texts::cancelled()));
-        return Ok(());
-    }
-
-    // 7. 调用 Service 层（upstream parity：干净写入，无冲突提示）
     let provider_id = provider.id.clone();
     ProviderService::add(&state, app_type.clone(), provider)?;
 
-    // 8. 成功消息
     println!(
         "\n{}",
         success(&texts::entity_added_success(

@@ -2228,19 +2228,6 @@ requires_openai_auth = true
     }
 }
 
-pub fn prompt_settings_config_for_add(
-    app_type: &AppType,
-) -> Result<SettingsConfigPromptResult, AppError> {
-    match app_type {
-        AppType::Claude => prompt_claude_config(None, None),
-        AppType::Codex => prompt_codex_config(None).map(SettingsConfigPromptResult::new),
-        AppType::Gemini => prompt_gemini_config(None).map(SettingsConfigPromptResult::new),
-        AppType::OpenCode => prompt_opencode_config(None).map(SettingsConfigPromptResult::new),
-        AppType::Hermes => prompt_hermes_config(None).map(SettingsConfigPromptResult::new),
-        AppType::OpenClaw => prompt_openclaw_config(None).map(SettingsConfigPromptResult::new),
-    }
-}
-
 /// Generate a clean TOML key from a provider name/id for use in model_provider and [model_providers.<key>].
 fn clean_codex_provider_key(raw: &str) -> String {
     crate::codex_config::clean_codex_provider_key(raw)
@@ -2286,7 +2273,48 @@ fn build_codex_settings_config(
     }
 }
 
-fn build_codex_settings_config_from_prompt(
+/// Parse a Codex provider's stored `settings_config` and extract the effective
+/// `base_url` and `model` from its `config` TOML, supporting both the flat
+/// (`base_url = ...`) and full upstream (`model_providers.<key>.base_url`) shapes.
+/// Used by the non-interactive `provider add` to inherit template-provided values
+/// when the caller does not pass `--base-url` / `--model`.
+pub(crate) fn codex_current_base_url_model(
+    current: Option<&Value>,
+) -> (Option<String>, Option<String>) {
+    let Some(cfg) = current
+        .and_then(|v| v.get("config"))
+        .and_then(|c| c.as_str())
+    else {
+        return (None, None);
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(cfg) else {
+        return (None, None);
+    };
+    let mut base_url = table
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if base_url.is_none() {
+        if let (Some(model_provider), Some(model_providers)) = (
+            table.get("model_provider").and_then(|v| v.as_str()),
+            table.get("model_providers").and_then(|v| v.as_table()),
+        ) {
+            base_url = model_providers
+                .get(model_provider)
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("base_url"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+    }
+    let model = table
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    (base_url, model)
+}
+
+pub(crate) fn build_codex_settings_config_from_prompt(
     current: Option<&Value>,
     api_key: &str,
     base_url: &str,
@@ -2355,7 +2383,7 @@ fn build_codex_settings_config_from_prompt(
     Value::Object(settings_obj)
 }
 
-fn build_gemini_oauth_settings_config(current: Option<&Value>) -> Value {
+pub(crate) fn build_gemini_oauth_settings_config(current: Option<&Value>) -> Value {
     let mut settings_obj = current
         .and_then(Value::as_object)
         .cloned()
@@ -2376,7 +2404,7 @@ fn build_gemini_oauth_settings_config(current: Option<&Value>) -> Value {
     Value::Object(settings_obj)
 }
 
-fn build_gemini_api_key_settings_config(
+pub(crate) fn build_gemini_api_key_settings_config(
     current: Option<&Value>,
     api_key: &str,
     base_url: &str,
@@ -3380,42 +3408,6 @@ pub fn generate_provider_id_for_app(
     }
 }
 
-pub fn prompt_provider_id_for_add(
-    app_type: &AppType,
-    name: &str,
-    existing_ids: &[String],
-) -> Result<String, AppError> {
-    if !ProviderService::is_provider_key_app(app_type) {
-        let generated_id = generate_provider_id_for_app(app_type, name, existing_ids);
-        return Ok(generated_id);
-    }
-
-    let generated_id = generate_provider_id_for_app(app_type, name, existing_ids);
-    let label = if matches!(app_type, AppType::Hermes) {
-        texts::tui_label_hermes_provider_key()
-    } else {
-        texts::id_label()
-    };
-    let input = Text::new(label)
-        .with_initial_value(&generated_id)
-        .with_help_message(if crate::cli::i18n::is_chinese() {
-            "留空则使用根据名称生成的 ID"
-        } else {
-            "Leave empty to use the generated ID from the provider name"
-        })
-        .prompt()
-        .map_err(|e| AppError::Message(texts::input_failed_error(&e.to_string())))?;
-
-    let id = if input.trim().is_empty() {
-        generated_id
-    } else {
-        input.trim().to_string()
-    };
-
-    validate_provider_id_for_add(app_type, &id, existing_ids)?;
-    Ok(id)
-}
-
 pub fn validate_provider_id_for_add(
     app_type: &AppType,
     id: &str,
@@ -3789,7 +3781,7 @@ fn claude_hide_attribution_enabled(settings_config: Option<&Value>) -> bool {
         && attribution.get("pr").and_then(Value::as_str) == Some("")
 }
 
-fn build_claude_settings_config_from_prompt<'a>(
+pub(crate) fn build_claude_settings_config_from_prompt<'a>(
     current: Option<&Value>,
     api_key_field: ClaudeApiKeyField,
     api_key: &str,
