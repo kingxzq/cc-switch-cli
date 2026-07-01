@@ -1182,6 +1182,11 @@ impl App {
         if changed && usage_query_provider_credential_field(selected) {
             provider.refresh_usage_query_custom_variable_comment();
         }
+        // The fallback model lives outside the model-mapping sub-page, so editing it
+        // here must still mark the model config touched to persist ANTHROPIC_MODEL.
+        if changed && selected == ProviderAddField::ClaudeFallbackModel {
+            provider.mark_claude_model_config_touched();
+        }
     }
 }
 

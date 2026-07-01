@@ -1447,6 +1447,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_fallback_model_edit_persists_anthropic_model() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Providers;
+        app.focus = Focus::Content;
+        app.on_key(key(KeyCode::Char('a')), &data());
+        app.on_key(key(KeyCode::Enter), &data());
+
+        if let Some(FormState::ProviderAdd(form)) = app.form.as_mut() {
+            form.name.set("Provider One");
+            form.focus = FormFocus::Fields;
+            form.field_idx = form
+                .fields()
+                .iter()
+                .position(|field| *field == ProviderAddField::ClaudeFallbackModel)
+                .expect("fallback model field should exist");
+            form.editing = true;
+        }
+
+        for ch in "gpt-4o".chars() {
+            app.on_key(key(KeyCode::Char(ch)), &data());
+        }
+
+        // The fallback row lives outside the model-mapping sub-page, but editing it
+        // must still mark the model config touched so ANTHROPIC_MODEL is persisted.
+        let provider = match app.form.as_ref() {
+            Some(FormState::ProviderAdd(form)) => {
+                assert_eq!(form.claude_model.value, "gpt-4o");
+                form.to_provider_json_value()
+            }
+            _ => panic!("provider form should stay open"),
+        };
+        assert_eq!(
+            provider["settingsConfig"]["env"]["ANTHROPIC_MODEL"].as_str(),
+            Some("gpt-4o"),
+        );
+    }
+
+    #[test]
     fn mcp_field_editor_supports_readline_shortcuts() {
         let mut app = App::new(Some(AppType::Claude));
         let mut form = McpAddFormState::new();
@@ -12146,9 +12184,10 @@ mod tests {
         app.on_key(key(KeyCode::Char('m')), &data);
         app.on_key(key(KeyCode::Char('1')), &data);
 
+        // The picker opens on the first role row (index 0 = reasoning model).
         let model = match app.form.as_ref() {
             Some(super::super::form::FormState::ProviderAdd(form)) => {
-                form.claude_model.value.clone()
+                form.claude_reasoning_model.value.clone()
             }
             other => panic!("expected ProviderAdd form, got: {other:?}"),
         };
@@ -12638,8 +12677,9 @@ mod tests {
         app.on_key(key(KeyCode::Char('j')), &data());
         app.on_key(key(KeyCode::Char('k')), &data());
 
+        // Index 0 in the model-mapping picker is now the reasoning role.
         let model = match app.form.as_ref() {
-            Some(FormState::ProviderAdd(form)) => form.claude_model.value.clone(),
+            Some(FormState::ProviderAdd(form)) => form.claude_reasoning_model.value.clone(),
             other => panic!("expected ProviderAdd form, got: {other:?}"),
         };
         assert_eq!(model, "jk");
@@ -13568,6 +13608,25 @@ mod tests {
         );
         assert!(text.contains("keep local routing enabled"), "{text}");
         assert!(!text.contains("Codex 原生"), "{text}");
+    }
+
+    #[test]
+    fn context_help_claude_fallback_model_shows_upstream_hint() {
+        let _lang = use_test_language(Language::English);
+        let mut app = App::new(Some(AppType::Claude));
+        app.form = Some(FormState::ProviderAdd(ProviderAddFormState::new(
+            AppType::Claude,
+        )));
+        select_provider_field(&mut app, ProviderAddField::ClaudeFallbackModel);
+
+        app.on_key(key(KeyCode::Char('?')), &UiData::default());
+        let text = help_text(&app);
+        assert!(text.contains("Default fallback model"), "{text}");
+        assert!(
+            text.contains("don't clearly map to a specific role model"),
+            "{text}"
+        );
+        assert!(!text.contains("默认兜底"), "{text}");
     }
 
     #[test]
@@ -14671,19 +14730,19 @@ mod tests {
         if let Some(FormState::ProviderAdd(form)) = app.form.as_mut() {
             form.claude_opus_model.set("claude-opus-4-20250514");
         }
-        // Select the Opus field (index 4)
+        // Select the Opus role (now index 3 of the four role rows)
         app.overlay = Overlay::ClaudeModelPicker {
-            selected: 4,
+            selected: 3,
             editing: false,
         };
 
         app.on_key(key(KeyCode::Char('a')), &data());
 
-        // Confirm should reference source_idx=4
+        // Confirm should reference source_idx=3
         assert!(matches!(
             &app.overlay,
             Overlay::Confirm(ConfirmOverlay {
-                action: ConfirmAction::ClaudeModelFillAll { source_idx: 4 },
+                action: ConfirmAction::ClaudeModelFillAll { source_idx: 3 },
                 ..
             })
         ));
@@ -14694,11 +14753,12 @@ mod tests {
             Some(FormState::ProviderAdd(f)) => f,
             _ => panic!("expected ProviderAdd form"),
         };
-        assert_eq!(form.claude_model.value, "claude-opus-4-20250514");
+        // Fill-all only spans the four role models; the fallback model is separate.
         assert_eq!(form.claude_reasoning_model.value, "claude-opus-4-20250514");
         assert_eq!(form.claude_haiku_model.value, "claude-opus-4-20250514");
         assert_eq!(form.claude_sonnet_model.value, "claude-opus-4-20250514");
         assert_eq!(form.claude_opus_model.value, "claude-opus-4-20250514");
+        assert_eq!(form.claude_model.value, "");
     }
 
     // ------------------------------------------------------------------
@@ -14714,7 +14774,7 @@ mod tests {
         app.overlay = Overlay::ModelFetchPicker {
             request_id: 1,
             field: ProviderAddField::ClaudeModelConfig,
-            claude_idx: Some(2),
+            claude_idx: Some(1),
             input: TextInput::new("claude-haiku-4-20250514"),
             query: String::new(),
             fetching: false,
@@ -14727,10 +14787,11 @@ mod tests {
         assert!(matches!(action, Action::None));
 
         // Should restore to ClaudeModelPicker with the correct selected index
+        // (index 1 is the Haiku role in the four-role mapping).
         assert!(matches!(
             app.overlay,
             Overlay::ClaudeModelPicker {
-                selected: 2,
+                selected: 1,
                 editing: false
             }
         ));
@@ -14808,12 +14869,12 @@ mod tests {
             }
         ));
 
-        // Should have picked the first model from the list
+        // Should have picked the first model from the list into index 0 (reasoning role)
         let form = match app.form.as_ref() {
             Some(FormState::ProviderAdd(f)) => f,
             _ => panic!("expected ProviderAdd form"),
         };
-        assert_eq!(form.claude_model.value, "model-a");
+        assert_eq!(form.claude_reasoning_model.value, "model-a");
     }
 
     #[test]

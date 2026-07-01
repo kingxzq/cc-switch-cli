@@ -11,7 +11,17 @@ pub(super) fn render_claude_model_picker_overlay(
     selected: usize,
     editing: bool,
 ) {
-    let area = centered_rect(OVERLAY_MD.0, OVERLAY_MD.1, content_area);
+    // Keep the percentage-based width, but cap the height to the four role rows
+    // rather than filling 62% of the screen (which left a large empty table).
+    // Height = outer borders(2) + key bar(1) + top gap(1) + table[border(2)+header(1)+4 rows] + hint(3).
+    let wide = centered_rect(OVERLAY_MD.0, OVERLAY_MD.1, content_area);
+    let desired_h = 14u16.min(content_area.height);
+    let area = Rect {
+        x: wide.x,
+        width: wide.width,
+        y: content_area.y + content_area.height.saturating_sub(desired_h) / 2,
+        height: desired_h,
+    };
     frame.render_widget(Clear, area);
 
     let outer = Block::default()
@@ -51,7 +61,6 @@ pub(super) fn render_claude_model_picker_overlay(
 
     if let Some(FormState::ProviderAdd(provider)) = app.form.as_ref() {
         let labels = [
-            texts::tui_claude_model_main_label(),
             texts::tui_claude_reasoning_model_label(),
             texts::tui_claude_default_haiku_model_label(),
             texts::tui_claude_default_sonnet_model_label(),
@@ -162,7 +171,30 @@ pub(super) fn render_claude_api_format_picker_overlay(
     theme: &theme::Theme,
     selected: usize,
 ) {
-    let area = centered_rect_fixed(58, 10, content_area);
+    let (app_type, current) = app
+        .form
+        .as_ref()
+        .and_then(|form| match form {
+            FormState::ProviderAdd(provider) => {
+                Some((provider.app_type.clone(), provider.claude_api_format))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            (
+                app.app_type.clone(),
+                crate::cli::tui::form::ClaudeApiFormat::Anthropic,
+            )
+        });
+
+    let choices = crate::cli::tui::form::ClaudeApiFormat::choices_for_app(&app_type);
+
+    // Size the height to the option rows so there is no large gap below them:
+    // borders(2) + key bar(1) + top/bottom gap(2) + one row per choice.
+    let height = (choices.len() as u16)
+        .saturating_add(5)
+        .min(content_area.height);
+    let area = centered_rect_fixed(58, height, content_area);
     frame.render_widget(Clear, area);
 
     let outer = Block::default()
@@ -195,23 +227,6 @@ pub(super) fn render_claude_api_format_picker_overlay(
         width: chunks[1].width.saturating_sub(4),
         height: chunks[1].height.saturating_sub(2),
     };
-    let (app_type, current) = app
-        .form
-        .as_ref()
-        .and_then(|form| match form {
-            FormState::ProviderAdd(provider) => {
-                Some((provider.app_type.clone(), provider.claude_api_format))
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            (
-                app.app_type.clone(),
-                crate::cli::tui::form::ClaudeApiFormat::Anthropic,
-            )
-        });
-
-    let choices = crate::cli::tui::form::ClaudeApiFormat::choices_for_app(&app_type);
     let items = choices.iter().copied().map(|api_format| {
         let marker = if api_format == current {
             texts::tui_marker_active()

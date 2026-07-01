@@ -1169,6 +1169,9 @@ pub(crate) fn provider_field_label_and_value(
         ProviderAddField::ClaudeApiFormat => texts::tui_label_claude_api_format().to_string(),
         ProviderAddField::ClaudeApiKey => texts::tui_label_api_key().to_string(),
         ProviderAddField::ClaudeModelConfig => texts::tui_label_claude_model_config().to_string(),
+        ProviderAddField::ClaudeFallbackModel => {
+            texts::tui_label_claude_fallback_model().to_string()
+        }
         ProviderAddField::ClaudeHideAttribution => {
             texts::tui_label_claude_hide_attribution().to_string()
         }
@@ -1216,6 +1219,7 @@ pub(crate) fn provider_field_label_and_value(
         ProviderAddField::HermesRateLimitDelay => {
             texts::tui_label_hermes_rate_limit_delay().to_string()
         }
+        ProviderAddField::ClaudeAdvancedDivider => "- - - - - - - - -".to_string(),
         ProviderAddField::HermesAdvancedDivider => "- - - - - - - - -".to_string(),
         ProviderAddField::CommonConfigDivider => "- - - - - - - - -".to_string(),
         ProviderAddField::CommonSnippet => texts::tui_config_item_common_snippet().to_string(),
@@ -1467,7 +1471,8 @@ pub(crate) fn codex_local_routing_field_editor_line(
 fn provider_field_is_divider(field: ProviderAddField) -> bool {
     matches!(
         field,
-        ProviderAddField::HermesAdvancedDivider
+        ProviderAddField::ClaudeAdvancedDivider
+            | ProviderAddField::HermesAdvancedDivider
             | ProviderAddField::CommonConfigDivider
             | ProviderAddField::UsageQueryDivider
     )

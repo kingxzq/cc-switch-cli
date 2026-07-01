@@ -288,8 +288,15 @@ fn provider_field_help(app_type: AppType, field: ProviderAddField) -> HelpConten
         ProviderAddField::ClaudeApiFormat => HelpContent::new(
             texts::tui_label_claude_api_format(),
             help_lines(
-                "选择供应商的协议格式。非 Anthropic 协议通常需要本地路由做格式转换。",
-                "Selects the provider protocol. Non-Anthropic formats usually need local routing for conversion.",
+                "选择供应商 API 的输入格式。非 Anthropic 协议通常需要开启本地路由做格式转换。",
+                "Select the input format for the provider's API. Non-Anthropic formats usually need local routing enabled for conversion.",
+            ),
+        ),
+        ProviderAddField::ClaudeFallbackModel => HelpContent::new(
+            texts::tui_label_claude_fallback_model(),
+            help_lines(
+                "用于未明确落到具体角色模型（Haiku、Sonnet、Opus 等）的请求。使用第三方/中转端点时建议填写：否则这些请求（含 Haiku 后台子任务）会以原始 Claude 模型名透传给上游，可能因上游无此模型而报错。官方端点可留空。",
+                "A fallback for requests that don't clearly map to a specific role model (Haiku, Sonnet, Opus, etc.). Recommended for third-party/relay endpoints—otherwise such requests (including Haiku background subtasks) are forwarded under their original Claude model name and may fail if the upstream doesn't host it. Safe to leave blank for official endpoints.",
             ),
         ),
         ProviderAddField::ClaudeHideAttribution => HelpContent::new(
@@ -416,6 +423,7 @@ fn provider_field_help(app_type: AppType, field: ProviderAddField) -> HelpConten
         ProviderAddField::CodexWireApi
         | ProviderAddField::CodexRequiresOpenaiAuth
         | ProviderAddField::CodexEnvKey
+        | ProviderAddField::ClaudeAdvancedDivider
         | ProviderAddField::HermesAdvancedDivider
         | ProviderAddField::CommonConfigDivider
         | ProviderAddField::UsageQueryDivider => HelpContent::empty(),
@@ -612,7 +620,8 @@ fn tr<'a>(zh: &'a str, en: &'a str) -> &'a str {
 fn provider_field_is_divider(field: ProviderAddField) -> bool {
     matches!(
         field,
-        ProviderAddField::HermesAdvancedDivider
+        ProviderAddField::ClaudeAdvancedDivider
+            | ProviderAddField::HermesAdvancedDivider
             | ProviderAddField::CommonConfigDivider
             | ProviderAddField::UsageQueryDivider
     )

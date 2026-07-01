@@ -1808,9 +1808,17 @@ pub mod texts {
 
     pub fn tui_label_claude_model_config() -> &'static str {
         if is_chinese() {
-            "Claude 模型配置"
+            "模型映射"
         } else {
-            "Claude Model Config"
+            "Model Mapping"
+        }
+    }
+
+    pub fn tui_label_claude_fallback_model() -> &'static str {
+        if is_chinese() {
+            "默认兜底模型"
+        } else {
+            "Default fallback model"
         }
     }
 
@@ -2940,9 +2948,9 @@ pub mod texts {
 
     pub fn tui_claude_model_config_popup_title() -> &'static str {
         if is_chinese() {
-            "Claude 模型配置"
+            "模型映射"
         } else {
-            "Claude Model Configuration"
+            "Model Mapping"
         }
     }
 
@@ -2988,9 +2996,9 @@ pub mod texts {
 
     pub fn tui_claude_model_config_summary(configured_count: usize) -> String {
         if is_chinese() {
-            format!("已配置 {configured_count}/5")
+            format!("已配置 {configured_count}/4")
         } else {
-            format!("Configured {configured_count}/5")
+            format!("Configured {configured_count}/4")
         }
     }
 
@@ -3020,11 +3028,10 @@ pub mod texts {
 
     pub fn tui_claude_model_label_for_index(idx: usize) -> &'static str {
         match idx {
-            0 => tui_claude_model_main_label(),
-            1 => tui_claude_reasoning_model_label(),
-            2 => tui_claude_default_haiku_model_label(),
-            3 => tui_claude_default_sonnet_model_label(),
-            4 => tui_claude_default_opus_model_label(),
+            0 => tui_claude_reasoning_model_label(),
+            1 => tui_claude_default_haiku_model_label(),
+            2 => tui_claude_default_sonnet_model_label(),
+            3 => tui_claude_default_opus_model_label(),
             _ => "",
         }
     }

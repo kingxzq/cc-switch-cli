@@ -4526,7 +4526,10 @@ fn claude_api_format_picker_overlay_is_compact_and_padded() {
 
     let theme = theme_for(&app.app_type);
     let content = super::content_pane_rect(buf.area, &theme);
-    let area = super::centered_rect_fixed(58, 10, content);
+    // Height tracks the option count (borders + key bar + gaps + one row per choice).
+    let choices = crate::cli::tui::form::ClaudeApiFormat::choices_for_app(&AppType::Claude);
+    let height = choices.len() as u16 + 5;
+    let area = super::centered_rect_fixed(58, height, content);
 
     assert_eq!(buf[(area.x, area.y)].symbol(), "┌");
     assert_eq!(

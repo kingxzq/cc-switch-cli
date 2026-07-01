@@ -890,6 +890,10 @@ fn provider_add_form_claude_fields_include_model_config_entry() {
 fn provider_add_form_claude_fields_include_hide_attribution_entry() {
     let form = ProviderAddFormState::new(AppType::Claude);
     let fields = form.fields();
+    let advanced_divider_idx = fields
+        .iter()
+        .position(|field| *field == ProviderAddField::ClaudeAdvancedDivider)
+        .expect("ClaudeAdvancedDivider field should exist");
     let model_cfg_idx = fields
         .iter()
         .position(|field| *field == ProviderAddField::ClaudeModelConfig)
@@ -904,13 +908,35 @@ fn provider_add_form_claude_fields_include_hide_attribution_entry() {
         .expect("CommonConfigDivider field should exist");
 
     assert!(
-        hide_attribution_idx > model_cfg_idx,
-        "hide attribution should appear after Claude model config"
+        hide_attribution_idx < advanced_divider_idx,
+        "hide attribution is a basic field, before the advanced divider"
+    );
+    assert!(
+        advanced_divider_idx < model_cfg_idx,
+        "model mapping should sit in the advanced section after the divider"
     );
     assert!(
         hide_attribution_idx < common_divider_idx,
         "hide attribution should stay with Claude-specific fields"
     );
+}
+
+#[test]
+fn provider_add_form_claude_advanced_section_groups_model_fields() {
+    let form = ProviderAddFormState::new(AppType::Claude);
+    let fields = form.fields();
+    let pos = |field: ProviderAddField| fields.iter().position(|candidate| *candidate == field);
+    let divider_idx = pos(ProviderAddField::ClaudeAdvancedDivider).expect("advanced divider");
+    for field in [
+        ProviderAddField::ClaudeApiFormat,
+        ProviderAddField::ClaudeModelConfig,
+        ProviderAddField::ClaudeFallbackModel,
+    ] {
+        assert!(
+            pos(field).expect("advanced field should be present") > divider_idx,
+            "{field:?} should sit after the advanced divider"
+        );
+    }
 }
 
 #[test]

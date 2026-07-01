@@ -518,7 +518,7 @@ impl App {
     fn handle_claude_model_picker_edit_key(&mut self, key: KeyEvent) -> Action {
         let selected = match &mut self.overlay {
             Overlay::ClaudeModelPicker { selected, editing } => {
-                *selected = (*selected).min(4);
+                *selected = (*selected).min(3);
                 if !*editing {
                     return Action::None;
                 }
@@ -553,7 +553,7 @@ impl App {
     fn handle_claude_model_picker_select_key(&mut self, key: KeyEvent) -> Action {
         let selected = match &mut self.overlay {
             Overlay::ClaudeModelPicker { selected, editing } => {
-                *selected = (*selected).min(4);
+                *selected = (*selected).min(3);
                 if *editing {
                     return Action::None;
                 }
@@ -572,7 +572,7 @@ impl App {
                 Action::None
             }
             KeyCode::Down => {
-                *selected = (*selected + 1).min(4);
+                *selected = (*selected + 1).min(3);
                 Action::None
             }
             KeyCode::Enter => {

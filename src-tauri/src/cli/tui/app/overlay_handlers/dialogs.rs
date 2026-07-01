@@ -131,7 +131,7 @@ impl App {
                                 .claude_model_input(source_idx)
                                 .map(|input| input.value.clone())
                                 .unwrap_or_default();
-                            for idx in 0..5 {
+                            for idx in 0..4 {
                                 if idx != source_idx {
                                     if let Some(input) = provider.claude_model_input_mut(idx) {
                                         input.set(value.clone());

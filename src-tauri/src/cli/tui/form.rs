@@ -186,6 +186,8 @@ pub enum ProviderAddField {
     ClaudeApiFormat,
     ClaudeApiKey,
     ClaudeModelConfig,
+    ClaudeFallbackModel,
+    ClaudeAdvancedDivider,
     ClaudeHideAttribution,
     CodexOAuthAccount,
     CodexFastMode,

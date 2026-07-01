@@ -358,14 +358,21 @@ impl ProviderAddFormState {
                 if self.is_claude_codex_oauth_provider() {
                     fields.push(ProviderAddField::CodexOAuthAccount);
                     fields.push(ProviderAddField::CodexFastMode);
+                    fields.push(ProviderAddField::ClaudeHideAttribution);
+                    fields.push(ProviderAddField::ClaudeAdvancedDivider);
                     fields.push(ProviderAddField::ClaudeModelConfig);
+                    fields.push(ProviderAddField::ClaudeFallbackModel);
                 } else if !self.is_claude_official_provider() {
                     fields.push(ProviderAddField::ClaudeBaseUrl);
-                    fields.push(ProviderAddField::ClaudeApiFormat);
                     fields.push(ProviderAddField::ClaudeApiKey);
+                    fields.push(ProviderAddField::ClaudeHideAttribution);
+                    fields.push(ProviderAddField::ClaudeAdvancedDivider);
+                    fields.push(ProviderAddField::ClaudeApiFormat);
                     fields.push(ProviderAddField::ClaudeModelConfig);
+                    fields.push(ProviderAddField::ClaudeFallbackModel);
+                } else {
+                    fields.push(ProviderAddField::ClaudeHideAttribution);
                 }
-                fields.push(ProviderAddField::ClaudeHideAttribution);
             }
             AppType::Codex => {
                 if !self.is_codex_official_provider() {
@@ -492,6 +499,7 @@ impl ProviderAddFormState {
             ProviderAddField::Notes => Some(&self.notes),
             ProviderAddField::ClaudeBaseUrl => Some(&self.claude_base_url),
             ProviderAddField::ClaudeApiKey => Some(&self.claude_api_key),
+            ProviderAddField::ClaudeFallbackModel => Some(&self.claude_model),
             ProviderAddField::CodexBaseUrl => Some(&self.codex_base_url),
             ProviderAddField::CodexModel => Some(&self.codex_model),
             ProviderAddField::CodexEnvKey => Some(&self.codex_env_key),
@@ -516,6 +524,7 @@ impl ProviderAddFormState {
             | ProviderAddField::CodexRequiresOpenaiAuth
             | ProviderAddField::ClaudeApiFormat
             | ProviderAddField::ClaudeModelConfig
+            | ProviderAddField::ClaudeAdvancedDivider
             | ProviderAddField::ClaudeHideAttribution
             | ProviderAddField::GeminiAuthType
             | ProviderAddField::OpenClawApiProtocol
@@ -540,6 +549,7 @@ impl ProviderAddFormState {
             ProviderAddField::Notes => Some(&mut self.notes),
             ProviderAddField::ClaudeBaseUrl => Some(&mut self.claude_base_url),
             ProviderAddField::ClaudeApiKey => Some(&mut self.claude_api_key),
+            ProviderAddField::ClaudeFallbackModel => Some(&mut self.claude_model),
             ProviderAddField::CodexBaseUrl => Some(&mut self.codex_base_url),
             ProviderAddField::CodexModel => Some(&mut self.codex_model),
             ProviderAddField::CodexEnvKey => Some(&mut self.codex_env_key),
@@ -568,6 +578,7 @@ impl ProviderAddFormState {
             | ProviderAddField::CodexRequiresOpenaiAuth
             | ProviderAddField::ClaudeApiFormat
             | ProviderAddField::ClaudeModelConfig
+            | ProviderAddField::ClaudeAdvancedDivider
             | ProviderAddField::ClaudeHideAttribution
             | ProviderAddField::GeminiAuthType
             | ProviderAddField::OpenClawApiProtocol
@@ -1283,31 +1294,30 @@ impl ProviderAddFormState {
         None
     }
 
+    // The model-mapping sub-page exposes only the four role models; the main
+    // model (ANTHROPIC_MODEL) is edited via the top-level ClaudeFallbackModel row.
     pub fn claude_model_input(&self, index: usize) -> Option<&TextInput> {
         match index {
-            0 => Some(&self.claude_model),
-            1 => Some(&self.claude_reasoning_model),
-            2 => Some(&self.claude_haiku_model),
-            3 => Some(&self.claude_sonnet_model),
-            4 => Some(&self.claude_opus_model),
+            0 => Some(&self.claude_reasoning_model),
+            1 => Some(&self.claude_haiku_model),
+            2 => Some(&self.claude_sonnet_model),
+            3 => Some(&self.claude_opus_model),
             _ => None,
         }
     }
 
     pub fn claude_model_input_mut(&mut self, index: usize) -> Option<&mut TextInput> {
         match index {
-            0 => Some(&mut self.claude_model),
-            1 => Some(&mut self.claude_reasoning_model),
-            2 => Some(&mut self.claude_haiku_model),
-            3 => Some(&mut self.claude_sonnet_model),
-            4 => Some(&mut self.claude_opus_model),
+            0 => Some(&mut self.claude_reasoning_model),
+            1 => Some(&mut self.claude_haiku_model),
+            2 => Some(&mut self.claude_sonnet_model),
+            3 => Some(&mut self.claude_opus_model),
             _ => None,
         }
     }
 
     pub fn claude_model_configured_count(&self) -> usize {
         [
-            &self.claude_model,
             &self.claude_reasoning_model,
             &self.claude_haiku_model,
             &self.claude_sonnet_model,
