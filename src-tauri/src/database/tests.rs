@@ -2391,3 +2391,95 @@ fn should_auto_extract_config_snippet_respects_snippet_and_cleared_flag() {
         .should_auto_extract_config_snippet("claude")
         .expect("gate after unset"));
 }
+
+#[test]
+fn memory_database_uses_incremental_auto_vacuum() {
+    let db = Database::memory().expect("create memory db");
+    let conn = db.conn.lock().expect("lock conn");
+    assert_eq!(
+        Database::get_auto_vacuum_mode(&conn).expect("read auto_vacuum"),
+        2,
+        "in-memory database should be configured with INCREMENTAL auto_vacuum"
+    );
+}
+
+#[test]
+fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
+    let temp = tempfile::NamedTempFile::new().expect("create temp db file");
+    let path = temp.path().to_path_buf();
+
+    let conn = Connection::open(&path).expect("open temp db");
+    conn.execute("PRAGMA auto_vacuum = NONE;", [])
+        .expect("set none auto_vacuum");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+
+    assert_eq!(
+        Database::get_auto_vacuum_mode(&conn).expect("auto_vacuum before rebuild"),
+        0,
+        "existing file db should start with NONE auto_vacuum"
+    );
+
+    let rebuilt =
+        Database::ensure_incremental_auto_vacuum_on_conn(&conn).expect("enable incremental mode");
+    assert!(
+        rebuilt,
+        "existing db with tables should require a VACUUM rebuild"
+    );
+    drop(conn);
+
+    let reopened = Connection::open(&path).expect("reopen temp db");
+    assert_eq!(
+        Database::get_auto_vacuum_mode(&reopened).expect("auto_vacuum after rebuild"),
+        2,
+        "file db should persist INCREMENTAL auto_vacuum after VACUUM rebuild"
+    );
+}
+
+/// issue #327 回归：存量库被 prune 删行后不会自动收缩（auto_vacuum=NONE 下
+/// `incremental_vacuum` 是空操作）；迁移到 INCREMENTAL 时的整库 VACUUM 应回收
+/// 这些历史空闲页，避免 WebDAV 同步对超大库反复全量拷贝。
+#[test]
+fn ensure_incremental_auto_vacuum_reclaims_bloated_free_pages() {
+    let temp = tempfile::NamedTempFile::new().expect("create temp db file");
+    let path = temp.path().to_path_buf();
+
+    let conn = Connection::open(&path).expect("open temp db");
+    conn.execute("PRAGMA auto_vacuum = NONE;", [])
+        .expect("set none auto_vacuum");
+    conn.execute("CREATE TABLE logs(id INTEGER PRIMARY KEY, blob TEXT);", [])
+        .expect("create logs table");
+
+    conn.execute_batch("BEGIN;").expect("begin");
+    {
+        let mut stmt = conn
+            .prepare("INSERT INTO logs(blob) VALUES (?1)")
+            .expect("prepare insert");
+        let payload = "x".repeat(2048);
+        for _ in 0..4000 {
+            stmt.execute([&payload]).expect("insert row");
+        }
+    }
+    conn.execute_batch("COMMIT;").expect("commit");
+
+    // 模拟 rollup_and_prune 删除历史明细行：空闲页仍留在文件里。
+    conn.execute("DELETE FROM logs WHERE id > 100;", [])
+        .expect("prune rows");
+    // 旧路径：auto_vacuum=NONE 时 incremental_vacuum 是空操作，文件不收缩。
+    conn.execute_batch("PRAGMA incremental_vacuum;")
+        .expect("noop incremental vacuum");
+    drop(conn);
+    let bloated = std::fs::metadata(&path).expect("stat bloated").len();
+
+    let conn = Connection::open(&path).expect("reopen temp db");
+    let rebuilt = Database::ensure_incremental_auto_vacuum_on_conn(&conn)
+        .expect("migrate to incremental auto_vacuum");
+    assert!(rebuilt, "bloated existing db should be rebuilt via VACUUM");
+    drop(conn);
+    let reclaimed = std::fs::metadata(&path).expect("stat reclaimed").len();
+
+    assert!(
+        reclaimed < bloated / 2,
+        "VACUUM migration should reclaim the majority of free pages \
+         (bloated={bloated} bytes, reclaimed={reclaimed} bytes)"
+    );
+}

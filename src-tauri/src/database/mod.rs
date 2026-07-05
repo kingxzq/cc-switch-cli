@@ -361,6 +361,89 @@ impl Database {
         Ok(())
     }
 
+    /// 读取当前连接的 `auto_vacuum` 模式（0=NONE, 1=FULL, 2=INCREMENTAL）。
+    pub(crate) fn get_auto_vacuum_mode(conn: &Connection) -> Result<i32, AppError> {
+        conn.query_row("PRAGMA auto_vacuum;", [], |row| row.get(0))
+            .map_err(|e| AppError::Database(format!("读取 auto_vacuum 失败: {e}")))
+    }
+
+    /// 判断库中是否已存在用户表（用于区分全新库与存量库）。
+    fn has_user_tables(conn: &Connection) -> Result<bool, AppError> {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Database(format!("读取表数量失败: {e}")))?;
+        Ok(count > 0)
+    }
+
+    /// 在给定连接上确保 `auto_vacuum = INCREMENTAL`。
+    ///
+    /// 若已是 INCREMENTAL 则直接返回 `Ok(false)`。对已有用户表的存量库，
+    /// 切换 `auto_vacuum` 需要整库 `VACUUM` 重建，重建后会一并回收此前累积的
+    /// 空闲页（例如被 `rollup_and_prune` 删除但从未归还操作系统的 `proxy_request_logs`
+    /// 页），并使后续的 `PRAGMA incremental_vacuum` 真正生效。返回是否发生了重建。
+    pub(crate) fn ensure_incremental_auto_vacuum_on_conn(
+        conn: &Connection,
+    ) -> Result<bool, AppError> {
+        let mode = Self::get_auto_vacuum_mode(conn)?;
+        if mode == 2 {
+            return Ok(false);
+        }
+
+        let has_tables = Self::has_user_tables(conn)?;
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
+            .map_err(|e| AppError::Database(format!("设置 auto_vacuum 失败: {e}")))?;
+
+        // 全新库（尚无用户表）设置 pragma 即可生效，无需 VACUUM。
+        if !has_tables {
+            return Ok(false);
+        }
+
+        conn.execute("VACUUM;", [])
+            .map_err(|e| AppError::Database(format!("执行 VACUUM 失败: {e}")))?;
+        conn.execute("PRAGMA foreign_keys = ON;", [])
+            .map_err(|e| AppError::Database(format!("恢复 foreign_keys 失败: {e}")))?;
+        Ok(true)
+    }
+
+    /// 确保本库启用增量 auto-vacuum；存量库首次迁移前会先做一次全量备份。
+    pub(crate) fn ensure_incremental_auto_vacuum(&self) -> Result<bool, AppError> {
+        let mode = {
+            let conn = lock_conn!(self.conn);
+            Self::get_auto_vacuum_mode(&conn)?
+        };
+        if mode == 2 {
+            return Ok(false);
+        }
+
+        let has_tables = {
+            let conn = lock_conn!(self.conn);
+            Self::has_user_tables(&conn)?
+        };
+        if has_tables {
+            log::info!(
+                "Detected auto_vacuum={mode}, rebuilding database to enable incremental vacuum"
+            );
+            self.backup_database_file()?;
+        }
+
+        let rebuilt = {
+            let conn = lock_conn!(self.conn);
+            Self::ensure_incremental_auto_vacuum_on_conn(&conn)?
+        };
+
+        if rebuilt {
+            log::info!("Incremental auto-vacuum enabled after database rebuild");
+        } else {
+            log::info!("Incremental auto-vacuum configured for new database");
+        }
+
+        Ok(rebuilt)
+    }
+
     /// 初始化数据库连接并创建表
     ///
     /// 数据库文件位于 `~/.cc-switch/cc-switch.db`
@@ -420,6 +503,16 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         Self::configure_connection(&conn)?;
+
+        // 全新库：在建表、且在切到 WAL 之前启用增量 auto-vacuum。
+        // 顺序很重要——`journal_mode=WAL` 会写入 page 1，之后再设 `auto_vacuum`
+        // 对空库将静默失效（模式仍为 NONE，需整库 VACUUM 才能切换）。
+        // unix 下文件已被预创建为空，因此以「是否已存在用户表」判断是否为全新库。
+        if !Self::has_user_tables(&conn)? {
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
         // 多进程并发：daemon 与 worker 都会打开这个文件，WAL + busy_timeout 让
         // 短暂的 SQLITE_BUSY 自动重试而不是直接失败。
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -452,6 +545,13 @@ impl Database {
 
         db.create_tables()?;
         db.apply_schema_migrations()?;
+        // 存量库若仍是 auto_vacuum=NONE（老版本从未启用增量回收），在此切换到
+        // INCREMENTAL 并整库 VACUUM 一次，回收历史累积的空闲页（issue #327：
+        // proxy_request_logs 等本地表被 prune 删除后文件从不收缩，导致 WebDAV
+        // 下载/上传对超大库反复全量拷贝而卡死）。失败不致命，仅记录告警。
+        if let Err(err) = db.ensure_incremental_auto_vacuum() {
+            log::warn!("Failed to ensure incremental auto-vacuum: {err}");
+        }
         db.ensure_model_pricing_seeded()?;
         db.run_usage_maintenance("startup");
 
@@ -500,6 +600,9 @@ impl Database {
         let conn = Connection::open_in_memory().map_err(|e| AppError::Database(e.to_string()))?;
 
         Self::configure_connection(&conn)?;
+        // 与文件库保持一致：建表前启用增量 auto-vacuum。
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let db = Self {
             conn: Mutex::new(conn),
