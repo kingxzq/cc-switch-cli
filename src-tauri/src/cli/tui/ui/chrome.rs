@@ -356,20 +356,19 @@ pub(super) fn render_footer(
             Style::default(),
         )]
     } else {
-        let nav_bg = super::theme::terminal_palette_color((101, 113, 160)); // #6571A0
-        let act_bg = super::theme::terminal_palette_color((248, 248, 248)); // #F8F8F8
-        let nav_fg = super::theme::terminal_palette_color((255, 255, 255));
-        let act_fg = super::theme::terminal_palette_color((108, 108, 108));
+        // Two chip families from the shared theme: nav keys on the muted
+        // comment blue, action keys on the same surface used by the page
+        // key bars, so the footer reads as part of one system.
         let nav_key_style = Style::default()
-            .fg(nav_fg)
-            .bg(nav_bg)
+            .fg(Color::White)
+            .bg(theme.comment)
             .add_modifier(Modifier::BOLD);
-        let nav_desc_style = Style::default().fg(nav_fg).bg(nav_bg);
+        let nav_desc_style = Style::default().fg(Color::White).bg(theme.comment);
         let act_key_style = Style::default()
-            .fg(act_fg)
-            .bg(act_bg)
+            .fg(Color::White)
+            .bg(theme.surface)
             .add_modifier(Modifier::BOLD);
-        let act_desc_style = Style::default().fg(act_fg).bg(act_bg);
+        let act_desc_style = Style::default().fg(Color::White).bg(theme.surface);
         let nav_sep = Span::styled("  ", nav_desc_style);
         let act_sep = Span::styled("  ", act_desc_style);
 
