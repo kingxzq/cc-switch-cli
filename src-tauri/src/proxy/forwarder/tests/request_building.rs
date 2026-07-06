@@ -326,10 +326,9 @@ async fn claude_prepare_request_sets_defaults_and_filters_blocked_caller_headers
         Some("2023-06-01")
     );
     assert_eq!(header_value(&request, "accept-encoding"), Some("gzip"));
-    assert_eq!(
-        header_value(&request, "authorization"),
-        Some("Bearer key-p1")
-    );
+    // A bare `apiKey` field carries no ANTHROPIC_* semantics, so the adapter
+    // uses the Anthropic strategy: x-api-key only, no Authorization header.
+    assert_eq!(header_value(&request, "authorization"), None);
     assert_eq!(header_value(&request, "x-api-key"), Some("key-p1"));
     assert_eq!(header_value(&request, "x-goog-api-key"), None);
     assert_eq!(
@@ -362,6 +361,44 @@ async fn claude_prepare_request_sets_defaults_and_filters_blocked_caller_headers
     assert_eq!(header_value(&request, "x-b3-sampled"), None);
     assert_eq!(header_value(&request, "traceparent"), None);
     assert_eq!(header_value(&request, "tracestate"), None);
+}
+
+#[tokio::test]
+async fn claude_opencode_go_openai_chat_sends_only_bearer_no_x_api_key() {
+    // Issue #330: OpenCode Go is a strict Anthropic-protocol endpoint. The user
+    // stores the credential in ANTHROPIC_AUTH_TOKEN (Bearer semantics) and picks
+    // the openai_chat API format. The proxy must forward only
+    // `Authorization: Bearer` upstream — the extra `x-api-key` the adapter used
+    // to add triggered a 401 "The API key you provided is invalid.".
+    let mut provider = Provider::with_id(
+        "opencode-go".to_string(),
+        "OpenCode Go".to_string(),
+        json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://opencode.ai/zen/go",
+                "ANTHROPIC_AUTH_TOKEN": "sk-oc-token"
+            }
+        }),
+        None,
+    );
+    provider.meta = Some(ProviderMeta {
+        api_format: Some("openai_chat".to_string()),
+        ..Default::default()
+    });
+
+    let request = build_request(&AppType::Claude, &provider, HeaderMap::new()).await;
+
+    // openai_chat transform rewrites /v1/messages -> /v1/chat/completions upstream.
+    assert_eq!(
+        request.url().as_str(),
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    // ANTHROPIC_AUTH_TOKEN => ClaudeAuth: Bearer only, no x-api-key (the #330 fix).
+    assert_eq!(
+        header_value(&request, "authorization"),
+        Some("Bearer sk-oc-token")
+    );
+    assert_eq!(header_value(&request, "x-api-key"), None);
 }
 
 #[tokio::test]

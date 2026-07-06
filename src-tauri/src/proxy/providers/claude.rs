@@ -413,6 +413,33 @@ impl ClaudeAdapter {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
+
+    /// Infer the default Anthropic auth strategy from which `ANTHROPIC_*` env
+    /// var the user filled in, matching Anthropic SDK semantics:
+    /// - `ANTHROPIC_AUTH_TOKEN` → `ClaudeAuth` (sends `Authorization: Bearer`)
+    /// - `ANTHROPIC_API_KEY`    → `Anthropic`  (sends `x-api-key`)
+    ///
+    /// Precedence matches [`Self::extract_key`]. Returns `None` when neither is
+    /// set so the caller can fall back (e.g. a direct `apiKey` field).
+    fn infer_anthropic_auth_strategy(&self, provider: &Provider) -> Option<AuthStrategy> {
+        let env = provider.settings_config.get("env")?;
+
+        let has_value = |key: &str| -> bool {
+            env.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+        };
+
+        if has_value("ANTHROPIC_AUTH_TOKEN") {
+            return Some(AuthStrategy::ClaudeAuth);
+        }
+        if has_value("ANTHROPIC_API_KEY") {
+            return Some(AuthStrategy::Anthropic);
+        }
+        None
+    }
 }
 
 impl Default for ClaudeAdapter {
@@ -513,7 +540,13 @@ impl ProviderAdapter for ClaudeAdapter {
         let strategy = match provider_type {
             ProviderType::OpenRouter => AuthStrategy::Bearer,
             ProviderType::ClaudeAuth => AuthStrategy::ClaudeAuth,
-            _ => AuthStrategy::Anthropic,
+            // Align with Anthropic SDK semantics: ANTHROPIC_AUTH_TOKEN → Bearer,
+            // ANTHROPIC_API_KEY → x-api-key. Emitting the wrong/extra header
+            // breaks strict Anthropic-protocol endpoints such as OpenCode Go
+            // (issue #330); a direct `apiKey` field keeps the x-api-key default.
+            _ => self
+                .infer_anthropic_auth_strategy(provider)
+                .unwrap_or(AuthStrategy::Anthropic),
         };
         self.extract_key(provider)
             .map(|key| AuthInfo::new(key, strategy))
@@ -547,9 +580,7 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn add_auth_headers(&self, request: RequestBuilder, auth: &AuthInfo) -> RequestBuilder {
         match auth.strategy {
-            AuthStrategy::Anthropic => request
-                .header("Authorization", format!("Bearer {}", auth.api_key))
-                .header("x-api-key", &auth.api_key),
+            AuthStrategy::Anthropic => request.header("x-api-key", &auth.api_key),
             AuthStrategy::ClaudeAuth => {
                 request.header("Authorization", format!("Bearer {}", auth.api_key))
             }
@@ -700,6 +731,80 @@ mod tests {
             settings_config,
             None,
         )
+    }
+
+    #[test]
+    fn anthropic_auth_token_env_uses_claude_auth_strategy() {
+        // ANTHROPIC_AUTH_TOKEN carries Bearer semantics in the Anthropic SDK, so
+        // it must resolve to ClaudeAuth (Authorization: Bearer only) — not the
+        // x-api-key Anthropic strategy. This is the OpenCode Go case (#330).
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://opencode.ai/zen/go",
+                "ANTHROPIC_AUTH_TOKEN": "sk-auth-token"
+            }
+        }));
+
+        let auth = adapter
+            .extract_auth(&provider)
+            .expect("auth should resolve");
+        assert_eq!(auth.api_key, "sk-auth-token");
+        assert_eq!(auth.strategy, AuthStrategy::ClaudeAuth);
+    }
+
+    #[test]
+    fn anthropic_api_key_env_uses_anthropic_strategy() {
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "ANTHROPIC_API_KEY": "sk-api-key"
+            }
+        }));
+
+        let auth = adapter
+            .extract_auth(&provider)
+            .expect("auth should resolve");
+        assert_eq!(auth.api_key, "sk-api-key");
+        assert_eq!(auth.strategy, AuthStrategy::Anthropic);
+    }
+
+    #[test]
+    fn anthropic_both_env_vars_prefer_auth_token() {
+        // extract_key prefers AUTH_TOKEN; the inferred strategy must stay aligned.
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "ANTHROPIC_AUTH_TOKEN": "sk-from-auth-token",
+                "ANTHROPIC_API_KEY": "sk-from-api-key"
+            }
+        }));
+
+        let auth = adapter
+            .extract_auth(&provider)
+            .expect("auth should resolve");
+        assert_eq!(auth.api_key, "sk-from-auth-token");
+        assert_eq!(auth.strategy, AuthStrategy::ClaudeAuth);
+    }
+
+    #[test]
+    fn direct_apikey_field_falls_back_to_anthropic_strategy() {
+        // No ANTHROPIC_* env means no explicit preference → Anthropic (x-api-key).
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider(json!({
+            "apiKey": "sk-direct",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+            }
+        }));
+
+        let auth = adapter
+            .extract_auth(&provider)
+            .expect("auth should resolve");
+        assert_eq!(auth.api_key, "sk-direct");
+        assert_eq!(auth.strategy, AuthStrategy::Anthropic);
     }
 
     #[test]

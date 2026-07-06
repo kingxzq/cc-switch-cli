@@ -242,10 +242,9 @@ async fn stream_openai_chat_transforms_sse_and_maps_model() {
         upstream_body.get("model").and_then(|v| v.as_str()),
         Some("mapped-sonnet")
     );
-    assert_eq!(
-        upstream_state.authorization.lock().await.as_deref(),
-        Some("Bearer sk-test-claude")
-    );
+    // ANTHROPIC_API_KEY carries x-api-key semantics: the proxy forwards only
+    // x-api-key upstream, with no Authorization header (issue #330).
+    assert_eq!(upstream_state.authorization.lock().await.as_deref(), None);
     assert_eq!(
         upstream_state.api_key.lock().await.as_deref(),
         Some("sk-test-claude")
@@ -649,10 +648,9 @@ async fn proxy_claude_openai_responses_streaming_transforms_sse() {
             .and_then(|v| v.as_str()),
         Some("input_text")
     );
-    assert_eq!(
-        upstream_state.authorization.lock().await.as_deref(),
-        Some("Bearer sk-test-claude")
-    );
+    // ANTHROPIC_API_KEY carries x-api-key semantics: the proxy forwards only
+    // x-api-key upstream, with no Authorization header (issue #330).
+    assert_eq!(upstream_state.authorization.lock().await.as_deref(), None);
     assert_eq!(
         upstream_state.api_key.lock().await.as_deref(),
         Some("sk-test-claude")

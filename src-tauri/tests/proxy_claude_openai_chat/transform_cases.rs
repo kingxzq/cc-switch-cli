@@ -220,10 +220,9 @@ async fn proxy_claude_openai_chat_transforms_request_and_response() {
         Some("hello")
     );
 
-    assert_eq!(
-        upstream_state.authorization.lock().await.as_deref(),
-        Some("Bearer sk-test-claude")
-    );
+    // ANTHROPIC_API_KEY carries x-api-key semantics: the proxy forwards only
+    // x-api-key upstream, with no Authorization header (issue #330).
+    assert_eq!(upstream_state.authorization.lock().await.as_deref(), None);
     assert_eq!(
         upstream_state.api_key.lock().await.as_deref(),
         Some("sk-test-claude")
@@ -488,10 +487,9 @@ async fn proxy_claude_openai_responses_transforms_request_and_response() {
     );
     assert!(upstream_body.get("messages").is_none());
 
-    assert_eq!(
-        upstream_state.authorization.lock().await.as_deref(),
-        Some("Bearer sk-test-claude")
-    );
+    // ANTHROPIC_API_KEY carries x-api-key semantics: the proxy forwards only
+    // x-api-key upstream, with no Authorization header (issue #330).
+    assert_eq!(upstream_state.authorization.lock().await.as_deref(), None);
     assert_eq!(
         upstream_state.api_key.lock().await.as_deref(),
         Some("sk-test-claude")
