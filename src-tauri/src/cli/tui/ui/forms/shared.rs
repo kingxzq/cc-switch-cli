@@ -204,7 +204,7 @@ pub(crate) fn render_form_template_chips(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(focus_block_style(active, theme))
-        .title(texts::tui_form_templates_title());
+        .title(format!(" {} ", texts::tui_form_templates_title()));
     frame.render_widget(template_block.clone(), area);
     let template_inner = template_block.inner(area);
 
@@ -295,7 +295,7 @@ pub(crate) fn render_form_json_preview_with_highlights(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(focus_block_style(active, theme))
-        .title(texts::tui_form_json_title());
+        .title(format!(" {} ", texts::tui_form_json_title()));
     frame.render_widget(json_block.clone(), area);
     let json_inner = json_block.inner(area);
 
@@ -348,7 +348,7 @@ pub(crate) fn render_form_text_preview(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(focus_block_style(active, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(block.clone(), area);
     let inner = block.inner(area);
 

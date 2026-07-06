@@ -21,7 +21,7 @@ pub(super) fn render_skills_discover(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

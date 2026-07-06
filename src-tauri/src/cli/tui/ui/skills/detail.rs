@@ -23,7 +23,7 @@ pub(super) fn render_skill_detail(
                         .borders(Borders::ALL)
                         .border_type(BorderType::Plain)
                         .border_style(pane_border_style(app, Focus::Content, theme))
-                        .title(texts::tui_skills_detail_title()),
+                        .title(format!(" {} ", texts::tui_skills_detail_title())),
                 ),
             area,
         );
@@ -34,7 +34,7 @@ pub(super) fn render_skill_detail(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_skills_detail_title());
+        .title(format!(" {} ", texts::tui_skills_detail_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

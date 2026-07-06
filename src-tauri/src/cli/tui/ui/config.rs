@@ -60,7 +60,7 @@ pub(super) fn render_config(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_config_title());
+        .title(format!(" {} ", texts::tui_config_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -101,7 +101,7 @@ pub(super) fn render_config_webdav(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_config_webdav_title());
+        .title(format!(" {} ", texts::tui_config_webdav_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -354,7 +354,7 @@ fn render_section_block(
             theme.comment
         }));
     if let Some(title) = title {
-        block = block.title(title);
+        block = block.title(format!(" {} ", title));
     }
     frame.render_widget(block.clone(), area);
     frame.render_widget(
@@ -543,7 +543,7 @@ fn render_openclaw_env_route(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -831,7 +831,7 @@ fn render_openclaw_tools_section_block(
         .border_style(openclaw_tools_section_border_style(theme, primary));
     if let Some(title) = title {
         block = block.title(Line::styled(
-            title.to_string(),
+            format!(" {title} "),
             openclaw_tools_section_title_style(theme, primary),
         ));
     }
@@ -888,7 +888,7 @@ fn render_openclaw_tools_route(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -1339,7 +1339,7 @@ fn render_openclaw_agents_section_block(
         .border_style(Style::default().fg(theme.dim));
     if let Some(title) = title {
         block = block.title(Line::styled(
-            title.to_string(),
+            format!(" {title} "),
             Style::default().fg(theme.comment),
         ));
     }
@@ -1399,7 +1399,7 @@ fn render_openclaw_agents_route(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -2080,7 +2080,7 @@ fn render_openclaw_workspace_section_block(
         .border_type(BorderType::Plain)
         .border_style(openclaw_workspace_section_border_style(theme, primary));
     if let Some(title) = title {
-        block = block.title(title);
+        block = block.title(format!(" {} ", title));
     }
     frame.render_widget(block.clone(), area);
 
@@ -2151,7 +2151,7 @@ fn render_openclaw_workspace(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_openclaw_workspace_title());
+        .title(format!(" {} ", texts::tui_openclaw_workspace_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
     let chunks = Layout::default()
@@ -2321,7 +2321,7 @@ fn render_openclaw_daily_memory(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_openclaw_daily_memory_title());
+        .title(format!(" {} ", texts::tui_openclaw_daily_memory_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
     let chunks = Layout::default()
@@ -2394,7 +2394,7 @@ pub(super) fn render_hermes_memory(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_hermes_memory_title());
+        .title(format!(" {} ", texts::tui_hermes_memory_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
     let chunks = Layout::default()
@@ -2615,7 +2615,7 @@ pub(super) fn render_settings(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::menu_settings());
+        .title(format!(" {} ", texts::menu_settings()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -2671,7 +2671,10 @@ pub(super) fn render_settings_managed_accounts(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_settings_managed_accounts_title());
+        .title(format!(
+            " {} ",
+            texts::tui_settings_managed_accounts_title()
+        ));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -2777,7 +2780,7 @@ fn render_managed_account_list(
         } else {
             Style::default().fg(theme.dim)
         })
-        .title(texts::tui_managed_accounts_list_title());
+        .title(format!(" {} ", texts::tui_managed_accounts_list_title()));
     frame.render_widget(block.clone(), area);
     let inner = inset_left(block.inner(area), CONTENT_INSET_LEFT);
 
@@ -2922,7 +2925,7 @@ fn render_managed_account_detail_panel(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.dim))
-        .title(texts::tui_managed_accounts_details_title());
+        .title(format!(" {} ", texts::tui_managed_accounts_details_title()));
     frame.render_widget(block.clone(), area);
     let inner = inset_left(block.inner(area), CONTENT_INSET_LEFT);
 
@@ -3165,7 +3168,7 @@ pub(super) fn render_settings_proxy(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_settings_proxy_title());
+        .title(format!(" {} ", texts::tui_settings_proxy_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

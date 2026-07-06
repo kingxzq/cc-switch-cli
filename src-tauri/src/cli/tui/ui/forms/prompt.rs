@@ -15,7 +15,7 @@ pub(crate) fn render_prompt_meta_form(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -47,7 +47,7 @@ pub(crate) fn render_prompt_meta_form(
             matches!(prompt.focus, FormFocus::Fields),
             theme,
         ))
-        .title(texts::tui_form_fields_title());
+        .title(format!(" {} ", texts::tui_form_fields_title()));
     frame.render_widget(fields_block.clone(), body[0]);
     let fields_inner = fields_block.inner(body[0]);
 
@@ -144,7 +144,7 @@ fn render_prompt_content_editor(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(focus_block_style(active, theme))
-        .title(texts::tui_editor_text_field_title());
+        .title(format!(" {} ", texts::tui_editor_text_field_title()));
     frame.render_widget(content_block.clone(), area);
     let content_inner = content_block.inner(area);
 

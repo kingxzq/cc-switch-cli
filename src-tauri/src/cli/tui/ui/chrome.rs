@@ -304,7 +304,7 @@ pub(super) fn render_nav(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
                 .border_style(pane_border_style(app, Focus::Nav, theme))
-                .title(texts::tui_nav_title()),
+                .title(format!(" {} ", texts::tui_nav_title())),
         )
         .row_highlight_style(selection_style(theme))
         .highlight_symbol(highlight_symbol(theme));

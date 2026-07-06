@@ -15,7 +15,7 @@ pub(super) fn render_mcp_env_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_mcp_env_title());
+        .title(format!(" {} ", texts::tui_mcp_env_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
     let chunks = Layout::default()
@@ -132,7 +132,7 @@ pub(super) fn render_mcp_env_entry_editor_overlay(
             } else {
                 Style::default().fg(theme.dim)
             })
-            .title(label);
+            .title(format!(" {} ", label));
         let input_area = chunks[idx + 1];
         let input_inner = block.inner(input_area);
         frame.render_widget(block, input_area);

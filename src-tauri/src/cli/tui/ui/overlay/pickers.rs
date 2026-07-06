@@ -28,7 +28,10 @@ pub(super) fn render_claude_model_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_claude_model_config_popup_title());
+        .title(format!(
+            " {} ",
+            texts::tui_claude_model_config_popup_title()
+        ));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -98,7 +101,7 @@ pub(super) fn render_claude_model_picker_overlay(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(texts::tui_form_fields_title()),
+                .title(format!(" {} ", texts::tui_form_fields_title())),
         )
         .row_highlight_style(selection_style(theme))
         .highlight_symbol(highlight_symbol(theme));
@@ -201,7 +204,7 @@ pub(super) fn render_claude_api_format_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_claude_api_format_popup_title());
+        .title(format!(" {} ", texts::tui_claude_api_format_popup_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -264,7 +267,7 @@ pub(super) fn render_usage_query_template_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_usage_query_template());
+        .title(format!(" {} ", texts::tui_usage_query_template()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -339,7 +342,7 @@ pub(super) fn render_managed_account_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_label_chatgpt_account());
+        .title(format!(" {} ", texts::tui_label_chatgpt_account()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -450,7 +453,7 @@ pub(super) fn render_managed_account_action_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(account_label);
+        .title(format!(" {} ", account_label));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -500,7 +503,7 @@ pub(super) fn render_provider_test_menu_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_provider_test_menu_title());
+        .title(format!(" {} ", texts::tui_provider_test_menu_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -643,7 +646,7 @@ pub(super) fn render_hermes_models_picker_overlay(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Plain)
-                .title(texts::tui_label_hermes_models()),
+                .title(format!(" {} ", texts::tui_label_hermes_models())),
         )
         .row_highlight_style(selection_style(theme))
         .highlight_symbol(highlight_symbol(theme));
@@ -778,7 +781,10 @@ pub(super) fn render_model_fetch_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_model_fetch_popup_title(fetching));
+        .title(format!(
+            " {} ",
+            texts::tui_model_fetch_popup_title(fetching)
+        ));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -794,7 +800,7 @@ pub(super) fn render_model_fetch_picker_overlay(
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .title(texts::tui_model_fetch_search_title());
+        .title(format!(" {} ", texts::tui_model_fetch_search_title()));
 
     frame.render_widget(input_block.clone(), chunks[0]);
     let input_inner = input_block.inner(chunks[0]);
@@ -889,7 +895,7 @@ pub(super) fn render_openclaw_agents_fallback_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(openclaw_agents_picker_title(app));
+        .title(format!(" {} ", openclaw_agents_picker_title(app)));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -1045,7 +1051,7 @@ pub(super) fn render_failover_queue_manager_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(crate::t!("Failover Queue", "故障转移队列"));
+        .title(format!(" {} ", crate::t!("Failover Queue", "故障转移队列")));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -1201,7 +1207,7 @@ pub(super) fn render_mcp_type_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_mcp_type_title());
+        .title(format!(" {} ", texts::tui_mcp_type_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -1306,7 +1312,7 @@ pub(super) fn render_skills_import_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, true))
-        .title(texts::tui_skills_import_title())
+        .title(format!(" {} ", texts::tui_skills_import_title()))
         .style(if theme.no_color {
             Style::default()
         } else {
@@ -1405,7 +1411,7 @@ pub(super) fn render_skills_sync_method_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_skills_sync_method_title());
+        .title(format!(" {} ", texts::tui_skills_sync_method_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -1477,7 +1483,7 @@ fn render_apps_picker_overlay<A>(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

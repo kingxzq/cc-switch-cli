@@ -161,7 +161,7 @@ pub(super) fn render_providers(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::menu_manage_providers());
+        .title(format!(" {} ", texts::menu_manage_providers()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

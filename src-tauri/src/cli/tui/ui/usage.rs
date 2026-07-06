@@ -16,7 +16,7 @@ pub(super) fn render_usage(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(usage_text("Usage Statistics", "使用统计"));
+        .title(format!(" {} ", usage_text("Usage Statistics", "使用统计")));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -50,7 +50,7 @@ pub(super) fn render_usage_logs(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(usage_text("Usage Details", "用量详情"));
+        .title(format!(" {} ", usage_text("Usage Details", "用量详情")));
     frame.render_widget(outer.clone(), area);
 
     let chunks = Layout::default()
@@ -99,7 +99,10 @@ pub(super) fn render_usage_log_detail(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(usage_text("Usage Log Detail", "用量日志详情"));
+        .title(format!(
+            " {} ",
+            usage_text("Usage Log Detail", "用量日志详情")
+        ));
     frame.render_widget(outer.clone(), area);
 
     let chunks = Layout::default()
@@ -544,7 +547,7 @@ fn render_usage_cache_hit_line(
     let ratio = rate.unwrap_or_default().clamp(0.0, 100.0) / 100.0;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.dim));
     let inner = inset_horizontal(block.inner(area), CONTENT_INSET_LEFT, CONTENT_INSET_LEFT);
     if inner.width < 12 || inner.height == 0 {
@@ -592,7 +595,7 @@ fn render_usage_trend(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.dim))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(block.clone(), area);
     let inner = inset_horizontal(block.inner(area), CONTENT_INSET_LEFT, 4);
 

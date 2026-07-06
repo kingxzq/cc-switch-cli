@@ -15,7 +15,7 @@ pub(super) fn render_help_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(content.title.clone());
+        .title(format!(" {} ", content.title.clone()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -62,7 +62,7 @@ pub(super) fn render_confirm_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, true))
-        .title(confirm.title.clone());
+        .title(format!(" {} ", confirm.title.clone()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -177,7 +177,7 @@ pub(super) fn render_text_input_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(input.title.clone())
+        .title(format!(" {} ", input.title.clone()))
         .style(if theme.no_color {
             Style::default()
         } else {
@@ -216,7 +216,7 @@ pub(super) fn render_text_input_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.accent))
-        .title(texts::tui_input_title())
+        .title(format!(" {} ", texts::tui_input_title()))
         .style(if theme.no_color {
             Style::default()
         } else {
@@ -259,7 +259,7 @@ pub(super) fn render_backup_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_backup_picker_title());
+        .title(format!(" {} ", texts::tui_backup_picker_title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -311,7 +311,7 @@ pub(super) fn render_text_view_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(title.to_string());
+        .title(format!(" {} ", title.to_string()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -344,7 +344,7 @@ pub(super) fn render_common_snippet_picker_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_config_item_common_snippet());
+        .title(format!(" {} ", texts::tui_config_item_common_snippet()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

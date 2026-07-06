@@ -11,7 +11,7 @@ pub(super) fn render_editor(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(editor.title.clone());
+        .title(format!(" {} ", editor.title.clone()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 

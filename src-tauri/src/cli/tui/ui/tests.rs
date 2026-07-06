@@ -297,10 +297,15 @@ fn tui_usage_overview_keeps_metric_values_near_labels() {
     let primary_y = line_index(&all, "Real Tokens");
     let secondary_y = line_index(&all, "Input");
     let tertiary_y = line_index(&all, "Errors");
-    let cache_border_y = all
-        .lines()
-        .position(|line| line.contains('╭'))
-        .unwrap_or_else(|| panic!("missing cache border in:\n{all}"));
+    // The cache box now uses the shared plain border; locate its top
+    // border as the first box corner after the metrics rows.
+    let cache_border_y = tertiary_y
+        + 1
+        + all
+            .lines()
+            .skip(tertiary_y + 1)
+            .position(|line| line.contains("┌"))
+            .unwrap_or_else(|| panic!("missing cache border in:\n{all}"));
     assert_eq!(secondary_y - primary_y, 1, "{all}");
     assert_eq!(tertiary_y - secondary_y, 1, "{all}");
     assert_eq!(cache_border_y - tertiary_y, 1, "{all}");
@@ -335,10 +340,15 @@ fn tui_usage_overview_short_height_keeps_even_spacing() {
     let primary_y = line_index(&all, "Real Tokens");
     let secondary_y = line_index(&all, "Input");
     let tertiary_y = line_index(&all, "Errors");
-    let cache_border_y = all
-        .lines()
-        .position(|line| line.contains('╭'))
-        .unwrap_or_else(|| panic!("missing cache border in:\n{all}"));
+    // The cache box now uses the shared plain border; locate its top
+    // border as the first box corner after the metrics rows.
+    let cache_border_y = tertiary_y
+        + 1
+        + all
+            .lines()
+            .skip(tertiary_y + 1)
+            .position(|line| line.contains("┌"))
+            .unwrap_or_else(|| panic!("missing cache border in:\n{all}"));
     assert_eq!(secondary_y - primary_y, 1, "{all}");
     assert_eq!(tertiary_y - secondary_y, 1, "{all}");
     assert_eq!(cache_border_y - tertiary_y, 1, "{all}");
@@ -1508,7 +1518,8 @@ fn cell_style_signature(cell: &ratatui::buffer::Cell) -> (Color, Color, Modifier
 }
 
 fn block_title_needle(title: &str) -> String {
-    format!("┌{}", buffer_cell_text(title))
+    // Block titles carry one column of padding on each side.
+    format!("┌ {}", buffer_cell_text(title))
 }
 
 fn block_label_needle(label: &str) -> String {

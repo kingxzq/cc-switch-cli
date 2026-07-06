@@ -15,7 +15,7 @@ pub(crate) fn render_mcp_add_form(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -70,7 +70,7 @@ pub(crate) fn render_mcp_add_form(
             matches!(mcp.focus, FormFocus::Fields),
             theme,
         ))
-        .title(texts::tui_form_fields_title());
+        .title(format!(" {} ", texts::tui_form_fields_title()));
     frame.render_widget(fields_block.clone(), body[0]);
     let fields_inner = fields_block.inner(body[0]);
 

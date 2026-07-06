@@ -25,7 +25,7 @@ pub(super) fn render_sessions(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::tui_sessions_title());
+        .title(format!(" {} ", texts::tui_sessions_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -98,7 +98,7 @@ fn render_session_list(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(session_pane_border_style(app, SessionsPane::List, theme))
-        .title(texts::menu_manage_sessions());
+        .title(format!(" {} ", texts::menu_manage_sessions()));
     frame.render_widget(block.clone(), area);
     let inner = block.inner(area);
 
@@ -255,7 +255,7 @@ fn render_session_overview(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.dim))
-        .title(texts::tui_sessions_overview_title());
+        .title(format!(" {} ", texts::tui_sessions_overview_title()));
     frame.render_widget(block.clone(), area);
 
     let Some(session) = session else {
@@ -336,7 +336,7 @@ fn render_session_messages(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(session_pane_border_style(app, SessionsPane::Detail, theme))
-        .title(texts::tui_sessions_messages_title());
+        .title(format!(" {} ", texts::tui_sessions_messages_title()));
     frame.render_widget(block.clone(), area);
     let inner = block.inner(area);
 

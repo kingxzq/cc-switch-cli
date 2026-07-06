@@ -25,7 +25,7 @@ pub(super) fn render_loading_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(full_title);
+        .title(format!(" {} ", full_title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -127,7 +127,7 @@ pub(super) fn render_update_available_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, true))
-        .title(texts::tui_update_available_title());
+        .title(format!(" {} ", texts::tui_update_available_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -200,7 +200,7 @@ pub(super) fn render_update_downloading_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, true))
-        .title(texts::tui_update_downloading_title());
+        .title(format!(" {} ", texts::tui_update_downloading_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -262,7 +262,7 @@ pub(super) fn render_update_result_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border_color))
-        .title(texts::tui_update_result_title());
+        .title(format!(" {} ", texts::tui_update_result_title()));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -309,7 +309,7 @@ fn render_compact_message_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(title);
+        .title(format!(" {} ", title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
@@ -349,7 +349,7 @@ fn render_result_overlay(
             .borders(Borders::ALL)
             .border_type(BorderType::Plain)
             .border_style(overlay_border_style(theme, false))
-            .title(compact_title);
+            .title(format!(" {} ", compact_title));
         frame.render_widget(outer.clone(), area);
         let inner = outer.inner(area);
 
@@ -380,7 +380,7 @@ fn render_result_overlay(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(overlay_border_style(theme, false))
-        .title(full_title);
+        .title(format!(" {} ", full_title));
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
 
