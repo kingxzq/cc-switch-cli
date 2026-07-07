@@ -88,12 +88,18 @@ same data; the fsync reduction helps weakest disks the most.
 
 ### P1 — Persistent session-scan cache with stale-while-revalidate
 
-Scope: `database/schema.rs` (+ new DAO), `session_manager/`,
+Scope: new sidecar cache store, `session_manager/`,
 `cli/tui/runtime_systems/workers.rs`, `cli/tui/app/types.rs`, TUI handlers.
 
-- New table `session_scan_cache`:
+- New table `session_scan_cache`
   `(provider TEXT, file_path TEXT PRIMARY KEY, mtime_ns INTEGER, size INTEGER,
-  meta JSON columns for SessionMeta fields)`.
+  meta TEXT, cache_version INTEGER)` — stored in a **separate local sidecar
+  database** (`$CC_SWITCH_CONFIG_DIR/session-scan-cache.db`), NOT in
+  cc-switch.db: the main database's schema is locked to the upstream project
+  (see Constraints) and WebDAV syncs it as a whole, while this cache is
+  machine-local (absolute paths) and fully rebuildable. The sidecar opens
+  with WAL + synchronous=NORMAL and degrades gracefully: any open/read error
+  behaves as an empty cache.
 - Scan flow becomes: load cached rows and render immediately; in the
   background walk the session directories with readdir+stat only; parse
   head/tail only for new files or files whose `(mtime_ns, size)` changed;
@@ -108,18 +114,42 @@ Scope: `database/schema.rs` (+ new DAO), `session_manager/`,
 Expected effect: first paint of the Sessions page under ~100 ms on any
 machine after the first run; disk work proportional to changed files only.
 
-### P2 — Byte-offset resume and Codex delta-state persistence
+### P2 — A shared incremental-sync driver with byte-offset resume
 
-Scope: `database/schema.rs` migration, `services/session_usage.rs`,
-`session_usage_codex.rs`.
+Scope: sidecar cache store, new `services/session_usage_driver.rs`,
+`services/session_usage.rs`, `session_usage_codex.rs`.
 
-- Add `last_byte_offset INTEGER` to `session_log_sync`. The Claude scanner
-  seeks to it directly instead of re-reading from byte 0. Legacy rows without
-  a byte offset fall back to one line-counted pass that records the byte
-  offset for next time.
-- Add a state column for Codex storing the last cumulative token snapshot
-  (small JSON) so a grown file resumes from the byte offset without
-  re-parsing history to rebuild `prev_total`.
+Every app's usage import goes through one shared contract, designed so new
+apps can be added without re-inventing the machinery:
+
+- **Authoritative progress** stays in cc-switch.db's `session_log_sync`
+  (`last_modified` + `last_line_offset`, upstream-compatible shape).
+- **Acceleration hints** live in the sidecar (`session_sync_resume`):
+  per-file byte offset plus a serialized parser state. A hint is honored only
+  when its `(last_modified, last_line_offset)` snapshot exactly matches the
+  authoritative row and the file has not shrunk; any mismatch (database
+  synced in from another machine, rotated file, missing hint) falls back to
+  today's read-from-zero line-counted pass and records a fresh hint.
+- **The generic JSONL driver** (`scan_jsonl_incremental`) owns: the mtime
+  skip, hint validation, seek-or-fallback, byte-exact line reading
+  (`read_until`), and line/byte bookkeeping. An app plugs in two things: a
+  serde-serializable parser state (Claude: `{session_id}`; Codex: the full
+  cumulative-token state machine) and a per-line callback. Parsing belongs to
+  the app; file driving belongs to the driver.
+- **Write semantics stay per-app** (Claude uses INSERT OR IGNORE with its
+  dedup key, Gemini upserts, Codex allows missing cache_creation): unifying
+  them would risk parity bugs for no scan-cost win. All apps follow the same
+  two-phase shape — scan/collect first, then batch-write in one transaction —
+  so the connection lock is never held while reading files.
+- Non-JSONL sources cannot byte-resume by nature and use the mtime-skip
+  contract only: Gemini re-reads its whole session JSON when changed;
+  OpenCode queries its external SQLite. They still share the sync-state
+  helpers and result shape.
+
+Adding a new app later means implementing: a file collector (walk + mtime,
+newest first), a parser state + line callback for the driver (if JSONL), and
+an insert function with the app's dedup semantics. Everything else — resume,
+batching, progress bookkeeping — is inherited.
 - Guard against truncation/rotation: if current file size < stored offset,
   reset and re-import that file from zero (dedup by request_id makes this
   safe).
@@ -148,8 +178,12 @@ Scope: TUI only.
 
 - Never touch host configuration (`$CC_SWITCH_CONFIG_DIR`, Claude/Codex/...
   live config dirs); all tests must isolate via `tests/support.rs` helpers.
-- Schema changes go through the versioned migration path in
-  `database/schema.rs` and must handle databases created by older builds.
+- **cc-switch.db's schema is locked to the upstream project**: no new tables,
+  no new columns, no `SCHEMA_VERSION` bump — the database syncs with upstream
+  builds (and via WebDAV across machines), so schema drift breaks
+  interoperability. Anything this plan needs to persist lives in a separate
+  machine-local sidecar store instead. Connection-level PRAGMAs and ordinary
+  data rows are fine.
 - Behavior parity: imported row contents, dedup semantics
   (`should_skip_session_insert`), and Usage aggregates must not change; only
   cost and ordering of work may change.
