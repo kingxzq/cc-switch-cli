@@ -17,9 +17,10 @@ use crate::opencode_config::get_opencode_db_path;
 use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    cached_model_pricing, get_all_sync_states, metadata_modified_nanos, update_sync_state_conn,
+    PricingCache, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
 use std::fs;
 use std::time::SystemTime;
@@ -69,7 +70,10 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
         file_modified = file_modified.max(metadata_modified_nanos(&wal_meta));
     }
 
-    let (last_modified, _last_offset) = get_sync_state(db, &db_path_str)?;
+    // 一次性预载全部同步状态（文件级 + 会话级），避免逐会话查库；也让下方所有
+    // 写入能在同一个写事务内完成，而不会与逐次 get_sync_state 的加锁互相自锁。
+    let sync_states = get_all_sync_states(db)?;
+    let (last_modified, _last_offset) = sync_states.get(&db_path_str).copied().unwrap_or((0, 0));
 
     // 文件未变化则跳过
     if file_modified <= last_modified {
@@ -94,13 +98,22 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
     };
     let mut has_sync_errors = false;
 
+    // 本次同步周期共享的定价缓存，避免每条消息重复查 model_pricing 表。
+    let mut pricing_cache = PricingCache::new();
+
     // 查询所有会话
     let sessions = query_sessions(&opencode_conn)?;
 
+    // 全部会话的插入与同步状态更新收敛到一个写事务，最后统一提交（一次 fsync）。
+    let mut guard = lock_conn!(db.conn);
+    let tx = guard
+        .transaction()
+        .map_err(|e| AppError::Database(format!("开启事务失败: {e}")))?;
+
     for (session_id, time_updated) in &sessions {
-        // 检查会话是否需要重新同步
+        // 检查会话是否需要重新同步（从预载快照读取）
         let sync_key = format!("{db_path_str}:{session_id}");
-        let (sess_last_modified, _) = get_sync_state(db, &sync_key)?;
+        let (sess_last_modified, _) = sync_states.get(&sync_key).copied().unwrap_or((0, 0));
         if *time_updated <= sess_last_modified {
             continue; // 会话未更新，跳过
         }
@@ -115,7 +128,13 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
                 for (message_id, msg_data) in &query_result.messages {
                     let request_id = format!("opencode_session:{session_id}:{message_id}");
 
-                    match insert_opencode_message(db, &request_id, msg_data, session_id) {
+                    match insert_opencode_message(
+                        &tx,
+                        &mut pricing_cache,
+                        &request_id,
+                        msg_data,
+                        session_id,
+                    ) {
                         Ok(true) => result.imported += 1,
                         Ok(false) => result.skipped += 1,
                         Err(e) => {
@@ -146,7 +165,7 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
         }
 
         // 更新会话级同步状态。失败时不要推进文件级状态，确保下次可重试。
-        if let Err(e) = update_sync_state(db, &sync_key, *time_updated, 0) {
+        if let Err(e) = update_sync_state_conn(&tx, &sync_key, *time_updated, 0) {
             let msg = format!("OpenCode 会话同步状态更新失败 {session_id}: {e}");
             log::warn!("[OPENCODE-SYNC] {msg}");
             result.errors.push(msg);
@@ -156,8 +175,12 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
 
     // 仅在本轮完全成功时推进文件级状态；否则保留下次重试入口。
     if !has_sync_errors {
-        update_sync_state(db, &db_path_str, file_modified, 0)?;
+        update_sync_state_conn(&tx, &db_path_str, file_modified, 0)?;
     }
+
+    tx.commit()
+        .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
+    drop(guard);
 
     if result.imported > 0 {
         log::info!(
@@ -309,14 +332,16 @@ fn parse_message_data(value: &serde_json::Value) -> Option<OpenCodeMessageData> 
 }
 
 /// 插入单条 OpenCode 消息记录到 proxy_request_logs
+///
+/// 调用方在同一事务连接上批量调用本函数；INSERT 与去重查询走 prepare_cached，
+/// 费用查询走 per-cycle 定价缓存。
 fn insert_opencode_message(
-    db: &Database,
+    conn: &rusqlite::Connection,
+    pricing_cache: &mut PricingCache,
     request_id: &str,
     msg: &OpenCodeMessageData,
     session_id: &str,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
-
     let created_at = if msg.timestamp_ms > 0 {
         msg.timestamp_ms / 1000
     } else {
@@ -339,7 +364,7 @@ fn insert_opencode_message(
         cache_creation_tokens: msg.cache_write_tokens,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    if should_skip_session_insert(conn, request_id, &dedup_key)? {
         return Ok(false);
     }
 
@@ -366,7 +391,7 @@ fn insert_opencode_message(
                 message_id: None,
             };
 
-            match find_model_pricing(&conn, &msg.model_id) {
+            match cached_model_pricing(conn, pricing_cache, &msg.model_id) {
                 Some(pricing) => {
                     let cost = CostCalculator::calculate_for_app(
                         "opencode",
@@ -392,20 +417,24 @@ fn insert_opencode_message(
             }
         };
 
-    let inserted_rows = conn.execute(
-        "INSERT OR IGNORE INTO proxy_request_logs (
+    let mut stmt = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
-        rusqlite::params![
+        )
+        .map_err(|e| AppError::Database(format!("插入 OpenCode 会话日志失败: {e}")))?;
+    let inserted_rows = stmt
+        .execute(rusqlite::params![
             request_id,
-            "_opencode_session",   // provider_id
-            "opencode",            // app_type
+            "_opencode_session", // provider_id
+            "opencode",          // app_type
             msg.model_id,
-            msg.model_id,          // request_model = model
+            msg.model_id, // request_model = model
             msg.input_tokens,
             output_with_reasoning,
             msg.cache_read_tokens,
@@ -415,19 +444,18 @@ fn insert_opencode_message(
             cache_read_cost,
             cache_creation_cost,
             total_cost,
-            0i64,                  // latency_ms
-            Option::<i64>::None,   // first_token_ms
-            200i64,                // status_code
-            Option::<String>::None,// error_message
+            0i64,                   // latency_ms
+            Option::<i64>::None,    // first_token_ms
+            200i64,                 // status_code
+            Option::<String>::None, // error_message
             Some(session_id.to_string()),
             Some("opencode_session"), // provider_type
-            1i64,                  // is_streaming
-            "1.0",                 // cost_multiplier
+            1i64,                     // is_streaming
+            "1.0",                    // cost_multiplier
             created_at,
-            "opencode_session",    // data_source
-        ],
-    )
-    .map_err(|e| AppError::Database(format!("插入 OpenCode 会话日志失败: {e}")))?;
+            "opencode_session", // data_source
+        ])
+        .map_err(|e| AppError::Database(format!("插入 OpenCode 会话日志失败: {e}")))?;
 
     Ok(inserted_rows > 0)
 }

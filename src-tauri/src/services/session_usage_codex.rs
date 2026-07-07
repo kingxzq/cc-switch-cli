@@ -16,12 +16,13 @@
 use crate::codex_config::get_codex_config_dir;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
-use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
+use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    cached_model_pricing, get_sync_state, metadata_modified_nanos, update_sync_state_conn,
+    PricingCache, SessionSyncResult, SESSION_LOG_COMMIT_BATCH,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -159,8 +160,11 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         return Ok(result);
     }
 
-    for file_path in &files {
-        match sync_single_codex_file(db, file_path) {
+    // 本次同步周期共享的定价缓存，避免每条消息重复查 model_pricing 表。
+    let mut pricing_cache = PricingCache::new();
+
+    for (file_path, file_mtime) in &files {
+        match sync_single_codex_file(db, file_path, *file_mtime, &mut pricing_cache) {
             Ok((imported, skipped)) => {
                 result.imported += imported;
                 result.skipped += skipped;
@@ -185,9 +189,11 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     Ok(result)
 }
 
-/// 收集所有 Codex 会话 JSONL 文件
-fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+/// 收集所有 Codex 会话 JSONL 文件，返回 `(路径, mtime 纳秒)` 并按 mtime 降序排序
+/// （最近修改的最先入库）。walk 阶段顺带取 mtime，既用于排序也传给后续处理，
+/// 避免二次 stat（读取失败记 0，交由 `sync_single_codex_file` 回退处理）。
+fn collect_codex_session_files(codex_dir: &Path) -> Vec<(PathBuf, i64)> {
+    let mut files: Vec<(PathBuf, i64)> = Vec::new();
 
     // 1. 扫描 sessions/YYYY/MM/DD/*.jsonl（日期分区目录）
     let sessions_dir = codex_dir.join("sessions");
@@ -202,17 +208,23 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    files.push(path);
+                    push_codex_file(&mut files, path);
                 }
             }
         }
     }
 
+    files.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     files
 }
 
-/// 递归扫描目录下的 .jsonl 文件（限制最大深度）
-fn collect_jsonl_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: u32, max_depth: u32) {
+/// 递归扫描目录下的 .jsonl 文件（限制最大深度），顺带记录 mtime。
+fn collect_jsonl_recursive(
+    dir: &Path,
+    files: &mut Vec<(PathBuf, i64)>,
+    depth: u32,
+    max_depth: u32,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -223,19 +235,39 @@ fn collect_jsonl_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: u32, max
         if path.is_dir() && depth < max_depth {
             collect_jsonl_recursive(&path, files, depth + 1, max_depth);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            files.push(path);
+            push_codex_file(files, path);
         }
     }
 }
 
+/// 记录一个 Codex jsonl 文件及其 mtime（读取失败记 0）。
+fn push_codex_file(files: &mut Vec<(PathBuf, i64)>, path: PathBuf) {
+    let mtime = fs::metadata(&path)
+        .map(|m| metadata_modified_nanos(&m))
+        .unwrap_or(0);
+    files.push((path, mtime));
+}
+
 /// 同步单个 Codex JSONL 文件，返回 (imported, skipped)
-fn sync_single_codex_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppError> {
+///
+/// `file_mtime` 为 walk 阶段取得的 mtime 纳秒值；>0 时直接复用避免二次 stat，
+/// 为 0 时回退到一次 metadata 读取，保留“元数据不可读即报错”语义。
+fn sync_single_codex_file(
+    db: &Database,
+    file_path: &Path,
+    file_mtime: i64,
+    pricing_cache: &mut PricingCache,
+) -> Result<(u32, u32), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
+    // mtime：优先使用 walk 阶段的值，回退到一次 metadata 读取
+    let file_modified = if file_mtime > 0 {
+        file_mtime
+    } else {
+        let metadata = fs::metadata(file_path)
+            .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+        metadata_modified_nanos(&metadata)
+    };
 
     // 检查同步状态
     let (last_modified, last_offset) = get_sync_state(db, &file_path_str)?;
@@ -260,6 +292,14 @@ fn sync_single_codex_file(db: &Database, file_path: &Path) -> Result<(u32, u32),
     let mut line_offset: i64 = 0;
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
+
+    // 整文件在一个事务内批量写入，超大文件每 SESSION_LOG_COMMIT_BATCH 行分段提交。
+    // 状态机（prev_total / event_index）为局部变量，跨分段提交仍然连续。
+    let mut guard = lock_conn!(db.conn);
+    let mut tx = guard
+        .transaction()
+        .map_err(|e| AppError::Database(format!("开启事务失败: {e}")))?;
+    let mut since_commit: u32 = 0;
 
     for line_result in reader.lines() {
         line_offset += 1;
@@ -401,7 +441,8 @@ fn sync_single_codex_file(db: &Database, file_path: &Path) -> Result<(u32, u32),
                     .map(|s| s.to_string());
 
                 match insert_codex_session_entry(
-                    db,
+                    &tx,
+                    pricing_cache,
                     &request_id,
                     &delta,
                     &state.current_model,
@@ -415,28 +456,48 @@ fn sync_single_codex_file(db: &Database, file_path: &Path) -> Result<(u32, u32),
                         skipped += 1;
                     }
                 }
+
+                since_commit += 1;
+                if since_commit >= SESSION_LOG_COMMIT_BATCH {
+                    tx.commit()
+                        .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
+                    tx = guard
+                        .transaction()
+                        .map_err(|e| AppError::Database(format!("开启事务失败: {e}")))?;
+                    since_commit = 0;
+                }
             }
             _ => {}
         }
     }
 
-    // 更新同步状态
-    update_sync_state(db, &file_path_str, file_modified, line_offset)?;
+    // 在同一事务内更新同步状态后统一提交
+    update_sync_state_conn(&tx, &file_path_str, file_modified, line_offset)?;
+    tx.commit()
+        .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
+    drop(guard);
+
+    // 每个文件若有新插入行，只通知一次（旧实现为每行一次）
+    if imported > 0 {
+        crate::usage_events::notify_log_recorded();
+    }
 
     Ok((imported, skipped))
 }
 
 /// 插入单条 Codex 会话记录到 proxy_request_logs
+///
+/// 调用方在同一事务连接上批量调用本函数；INSERT 与去重查询走 prepare_cached，
+/// 费用查询走 per-cycle 定价缓存。
 fn insert_codex_session_entry(
-    db: &Database,
+    conn: &rusqlite::Connection,
+    pricing_cache: &mut PricingCache,
     request_id: &str,
     delta: &DeltaTokens,
     model: &str,
     session_id: Option<&str>,
     timestamp: Option<&str>,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
-
     let created_at = timestamp
         .and_then(|ts| {
             chrono::DateTime::parse_from_rfc3339(ts)
@@ -459,7 +520,7 @@ fn insert_codex_session_entry(
         cache_creation_tokens: 0,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    if should_skip_session_insert(conn, request_id, &dedup_key)? {
         return Ok(false);
     }
 
@@ -473,7 +534,8 @@ fn insert_codex_session_entry(
         message_id: None,
     };
 
-    let pricing = find_codex_pricing(&conn, model);
+    // model 在调用处已 normalize_codex_model，缓存键直接使用归一化后的名字。
+    let pricing = cached_model_pricing(conn, pricing_cache, model);
     let multiplier = Decimal::from(1);
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
@@ -496,8 +558,8 @@ fn insert_codex_session_entry(
         ),
     };
 
-    let inserted_rows = conn
-        .execute(
+    let mut stmt = conn
+        .prepare_cached(
             "INSERT OR IGNORE INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -505,45 +567,37 @@ fn insert_codex_session_entry(
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
-            rusqlite::params![
-                request_id,
-                "_codex_session",    // provider_id
-                "codex",             // app_type
-                model,
-                model,               // request_model = model
-                delta.input,
-                delta.output,
-                delta.cached_input,
-                0i64,                // cache_creation_tokens: Codex 日志无此数据
-                input_cost,
-                output_cost,
-                cache_read_cost,
-                cache_creation_cost,
-                total_cost,
-                0i64,                // latency_ms
-                Option::<i64>::None, // first_token_ms
-                200i64,              // status_code
-                Option::<String>::None, // error_message
-                session_id.map(|s| s.to_string()),
-                Some("codex_session"), // provider_type
-                1i64,                // is_streaming
-                "1.0",               // cost_multiplier
-                created_at,
-                "codex_session",     // data_source
-            ],
         )
         .map_err(|e| AppError::Database(format!("插入 Codex 会话日志失败: {e}")))?;
-
-    if inserted_rows > 0 {
-        crate::usage_events::notify_log_recorded();
-    }
+    stmt.execute(rusqlite::params![
+        request_id,
+        "_codex_session", // provider_id
+        "codex",          // app_type
+        model,
+        model, // request_model = model
+        delta.input,
+        delta.output,
+        delta.cached_input,
+        0i64, // cache_creation_tokens: Codex 日志无此数据
+        input_cost,
+        output_cost,
+        cache_read_cost,
+        cache_creation_cost,
+        total_cost,
+        0i64,                   // latency_ms
+        Option::<i64>::None,    // first_token_ms
+        200i64,                 // status_code
+        Option::<String>::None, // error_message
+        session_id.map(|s| s.to_string()),
+        Some("codex_session"), // provider_type
+        1i64,                  // is_streaming
+        "1.0",                 // cost_multiplier
+        created_at,
+        "codex_session", // data_source
+    ])
+    .map_err(|e| AppError::Database(format!("插入 Codex 会话日志失败: {e}")))?;
 
     Ok(true)
-}
-
-/// 查找 Codex 模型定价（带归一化）
-fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<ModelPricing> {
-    find_model_pricing(conn, &normalize_codex_model(model_id))
 }
 
 #[cfg(test)]
@@ -694,14 +748,19 @@ mod tests {
             cached_input: 1,
             output: 2,
         };
-        let inserted = insert_codex_session_entry(
-            &db,
-            "codex-session-dup",
-            &delta,
-            "gpt-5.4",
-            Some("session-1"),
-            Some("1970-01-01T00:16:45Z"),
-        )?;
+        let mut pricing_cache = PricingCache::new();
+        let inserted = {
+            let conn = lock_conn!(db.conn);
+            insert_codex_session_entry(
+                &conn,
+                &mut pricing_cache,
+                "codex-session-dup",
+                &delta,
+                "gpt-5.4",
+                Some("session-1"),
+                Some("1970-01-01T00:16:45Z"),
+            )?
+        };
         assert!(!inserted);
 
         let conn = lock_conn!(db.conn);
