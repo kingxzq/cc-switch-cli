@@ -690,70 +690,27 @@ fn handle_session_req(req: SessionReq, tx: &mpsc::Sender<SessionMsg>) -> Result<
             provider_id,
             force,
         } => {
-            // Open the sidecar scan-cache store (a separate local database file —
-            // the synced main database is not involved). If it cannot be opened,
-            // fall back to the original in-memory-only full scan so the page
-            // still works.
-            let Ok(store) = crate::session_manager::scan_cache_store::ScanCacheStore::open() else {
-                let result = std::panic::catch_unwind(|| {
-                    if provider_id == "all" {
-                        crate::session_manager::scan_sessions()
-                    } else {
-                        crate::session_manager::scan_sessions_for_provider(&provider_id)
-                    }
-                })
-                .map_err(|_| "session scan panicked".to_string());
-                return tx
-                    .send(SessionMsg::ScanFinished { request_id, result })
-                    .map_err(|_| ());
-            };
-
-            // Phase 1 (stale): paint the cached snapshot immediately. Skipped on a
-            // forced reload and when the cache is empty (first-ever run).
-            if !force {
-                let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::session_manager::load_scan_cache_snapshot(&store, &provider_id)
-                }))
-                .unwrap_or_default();
-                if !snapshot.is_empty() {
-                    let _ = tx.send(SessionMsg::ScanCachedSnapshot {
-                        request_id,
-                        rows: snapshot,
-                    });
+            // 会话扫描（尤其首扫全量解析，可达数十秒）放到一次性 detached 线程执行，
+            // worker 循环立即回去处理后续的 LoadMessages/Search/Delete，避免长扫描把
+            // 交互请求全部堵在队列里。UI 入口侧（自动进入页面 + 手动 r）都以
+            // scan_active/loading 防抖，保证同一时刻至多一个扫描在飞（详见
+            // queue_sessions_refresh_if_needed 与 Action::SessionsRefresh），故这里无需
+            // 额外的并发标志；即便偶发起了两个，旧线程的 partial/finished 带旧
+            // request_id，UI 侧按 scan_active 天然拒收，最多浪费一次 IO。
+            let tx_scan = tx.clone();
+            let provider_for_scan = provider_id.clone();
+            match std::thread::Builder::new()
+                .name("cc-switch-session-scan".to_string())
+                .spawn(move || run_session_scan(request_id, provider_for_scan, force, &tx_scan))
+            {
+                Ok(_handle) => {} // detached：不 join，worker 立即返回
+                Err(err) => {
+                    // 线程起不来（极罕见）：退回同步执行，保证功能可用（阻塞是次要问题）。
+                    log::debug!("[SESSION-SCAN] 扫描线程启动失败，同步执行: {err}");
+                    run_session_scan(request_id, provider_id, force, tx);
                 }
             }
-
-            // Phase 2 (revalidate): stat the directories, re-parse only changed
-            // files, persist the delta, and send the final authoritative list.
-            // The "all" view scans provider by provider, emitting a partial
-            // after each so a genuine full scan paints progressively.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if provider_id == "all" {
-                    let mut merged = Vec::new();
-                    for pid in crate::session_manager::CACHED_PROVIDERS {
-                        let rows = crate::session_manager::scan_sessions_cached_for_provider(
-                            &store, pid, force,
-                        );
-                        let _ = tx.send(SessionMsg::ScanPartial {
-                            request_id,
-                            provider_id: pid.to_string(),
-                            rows: rows.clone(),
-                        });
-                        merged.extend(rows);
-                    }
-                    crate::session_manager::sort_by_recent(&mut merged);
-                    merged
-                } else {
-                    crate::session_manager::scan_sessions_cached_for_provider(
-                        &store,
-                        &provider_id,
-                        force,
-                    )
-                }
-            }))
-            .map_err(|_| "session scan panicked".to_string());
-            tx.send(SessionMsg::ScanFinished { request_id, result })
-                .map_err(|_| ())
+            Ok(())
         }
         SessionReq::LoadMessages {
             request_id,
@@ -785,6 +742,17 @@ fn handle_session_req(req: SessionReq, tx: &mpsc::Sender<SessionMsg>) -> Result<
                             Err("Session was not deleted".to_string())
                         }
                     });
+            // 删除成功后同步清掉该文件的 sidecar 扫描缓存行，否则下次启动时
+            // stale-while-revalidate 的秒开快照会让已删除会话短暂"复活"（要等
+            // 后台重扫的 deletes 才清）。纯缓存操作，失败只记 debug，不影响删除结果。
+            if result.is_ok() {
+                match crate::session_manager::scan_cache_store::ScanCacheStore::open() {
+                    Ok(store) => purge_scan_cache_row(&store, &source_path),
+                    Err(err) => log::debug!(
+                        "[SESSION-SCAN] 删除会话后打开扫描缓存失败 ({source_path}): {err}"
+                    ),
+                }
+            }
             tx.send(SessionMsg::DeleteFinished {
                 request_id,
                 key,
@@ -804,6 +772,87 @@ fn handle_session_req(req: SessionReq, tx: &mpsc::Sender<SessionMsg>) -> Result<
             tx.send(SessionMsg::SearchFinished { request_id, result })
                 .map_err(|_| ())
         }
+    }
+}
+
+/// 执行一次会话扫描的两阶段逻辑（供 detached 扫描线程与线程启动失败时的同步
+/// 回退共用）：sidecar 打不开时退回旧的纯内存全量扫描；否则先用缓存快照秒开
+/// （非强制刷新时），再逐 provider 增量重扫并发 partial，最后发 ScanFinished。
+/// 全程用 catch_unwind 兜底，panic 转成 Err 结果由 UI 呈现。tx 发送失败（UI 已
+/// 退出）时静默结束。
+fn run_session_scan(
+    request_id: u64,
+    provider_id: String,
+    force: bool,
+    tx: &mpsc::Sender<SessionMsg>,
+) {
+    // Open the sidecar scan-cache store (a separate local database file — the
+    // synced main database is not involved). If it cannot be opened, fall back
+    // to the original in-memory-only full scan so the page still works.
+    let Ok(store) = crate::session_manager::scan_cache_store::ScanCacheStore::open() else {
+        let result = std::panic::catch_unwind(|| {
+            if provider_id == "all" {
+                crate::session_manager::scan_sessions()
+            } else {
+                crate::session_manager::scan_sessions_for_provider(&provider_id)
+            }
+        })
+        .map_err(|_| "session scan panicked".to_string());
+        let _ = tx.send(SessionMsg::ScanFinished { request_id, result });
+        return;
+    };
+
+    // Phase 1 (stale): paint the cached snapshot immediately. Skipped on a
+    // forced reload and when the cache is empty (first-ever run).
+    if !force {
+        let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::session_manager::load_scan_cache_snapshot(&store, &provider_id)
+        }))
+        .unwrap_or_default();
+        if !snapshot.is_empty() {
+            let _ = tx.send(SessionMsg::ScanCachedSnapshot {
+                request_id,
+                rows: snapshot,
+            });
+        }
+    }
+
+    // Phase 2 (revalidate): stat the directories, re-parse only changed files,
+    // persist the delta, and send the final authoritative list. The "all" view
+    // scans provider by provider, emitting a partial after each so a genuine
+    // full scan paints progressively.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if provider_id == "all" {
+            let mut merged = Vec::new();
+            for pid in crate::session_manager::CACHED_PROVIDERS {
+                let rows =
+                    crate::session_manager::scan_sessions_cached_for_provider(&store, pid, force);
+                let _ = tx.send(SessionMsg::ScanPartial {
+                    request_id,
+                    provider_id: pid.to_string(),
+                    rows: rows.clone(),
+                });
+                merged.extend(rows);
+            }
+            crate::session_manager::sort_by_recent(&mut merged);
+            merged
+        } else {
+            crate::session_manager::scan_sessions_cached_for_provider(&store, &provider_id, force)
+        }
+    }))
+    .map_err(|_| "session scan panicked".to_string());
+    let _ = tx.send(SessionMsg::ScanFinished { request_id, result });
+}
+
+/// 从 sidecar 扫描缓存里删除某个会话文件的行（删除会话成功后调用）。纯缓存
+/// 操作：失败只记 debug，不影响删除结果；路径不在缓存里（如 "sqlite:" 前缀的
+/// 会话）时是无害 no-op。
+fn purge_scan_cache_row(
+    store: &crate::session_manager::scan_cache_store::ScanCacheStore,
+    source_path: &str,
+) {
+    if let Err(err) = store.delete_paths(&[source_path.to_string()]) {
+        log::debug!("[SESSION-SCAN] 删除会话后清理扫描缓存失败 ({source_path}): {err}");
     }
 }
 
@@ -1789,6 +1838,36 @@ mod tests {
             session_id: key.to_string(),
             source_path: format!("/tmp/{key}.jsonl"),
         }
+    }
+
+    /// fix 4：删除会话成功后清掉 sidecar 缓存行，避免下次启动的 stale 快照复活
+    /// 已删除会话。缓存里没有的路径为无害 no-op。
+    #[test]
+    fn purge_scan_cache_row_removes_deleted_session() {
+        use crate::session_manager::cache::{SessionScanCacheEntry, SCAN_CACHE_VERSION};
+        use crate::session_manager::scan_cache_store::ScanCacheStore;
+
+        let store = ScanCacheStore::in_memory().expect("open memory store");
+        store
+            .upsert_batch(&[SessionScanCacheEntry {
+                file_path: "/tmp/gone.jsonl".to_string(),
+                provider: "claude".to_string(),
+                mtime_ns: 1,
+                size: 10,
+                meta_json: "{}".to_string(),
+                cache_version: SCAN_CACHE_VERSION,
+            }])
+            .expect("upsert");
+        assert_eq!(store.load_for_provider("claude").expect("load").len(), 1);
+
+        purge_scan_cache_row(&store, "/tmp/gone.jsonl");
+        assert!(
+            store.load_for_provider("claude").expect("load").is_empty(),
+            "已删除会话的缓存行应被清除"
+        );
+
+        // 不存在的路径不 panic、不报错（无害 no-op）
+        purge_scan_cache_row(&store, "/tmp/never-existed.jsonl");
     }
 
     #[test]

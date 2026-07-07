@@ -223,6 +223,17 @@ pub(crate) fn handle_action(
                 );
                 return Ok(());
             };
+            // A scan already runs on a detached worker thread (workers.rs). If we
+            // start another scan here it bumps scan_active to a new id, so the
+            // in-flight thread's partial/finished messages (carrying the old id)
+            // get rejected — and if the worker were to drop the superseding
+            // Refresh, the UI would stay loading forever. Serialize from the entry
+            // side instead: while a scan is active, ignore `r` (a reload during an
+            // ongoing scan is a no-op by design). The automatic entry point
+            // (queue_sessions_refresh_if_needed) already guards on `loading`.
+            if ctx.app.sessions.scan_active.is_some() {
+                return Ok(());
+            }
             // In "show all providers" mode, refresh must rescan every provider
             // (the virtual "all" id), otherwise `r` would only refresh the
             // current app and the stale "all" cache would be restored afterward.
