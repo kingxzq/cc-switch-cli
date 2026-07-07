@@ -93,7 +93,14 @@ fn scan_targets() -> Vec<FileScanTarget> {
         if !sessions_dir.is_dir() {
             continue;
         }
-        cache::collect_targets_recursive(&sessions_dir, "jsonl", &mut targets);
+        let mut agent_targets = Vec::new();
+        cache::collect_targets_recursive(&sessions_dir, "jsonl", &mut agent_targets);
+        // 标题派生自旁路的 sessions.json 显示名索引：它变化时缓存也必须失效
+        let display_names = sessions_dir.join("sessions.json");
+        for target in &mut agent_targets {
+            cache::mix_sibling_into_fingerprint(target, &display_names);
+        }
+        targets.extend(agent_targets);
     }
     targets
 }

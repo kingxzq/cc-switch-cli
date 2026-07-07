@@ -88,6 +88,14 @@ fn merge_json_sqlite(
 fn scan_targets(storage: &Path) -> Vec<FileScanTarget> {
     let mut targets = Vec::new();
     cache::collect_targets_recursive(&storage.join("session"), "json", &mut targets);
+    // 无显式 title 时 summary 派生自旁路的 message/part 文件：混入该会话
+    // message 目录的指纹（目录 mtime 随条目增删变化），它变化时缓存失效
+    let message_root = storage.join("message");
+    for target in &mut targets {
+        if let Some(stem) = target.path.file_stem().and_then(|s| s.to_str()) {
+            cache::mix_sibling_into_fingerprint(target, &message_root.join(stem));
+        }
+    }
     targets
 }
 

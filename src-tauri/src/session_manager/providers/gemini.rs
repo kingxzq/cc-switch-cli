@@ -73,7 +73,14 @@ fn scan_targets() -> Vec<FileScanTarget> {
         if !chats_dir.is_dir() {
             continue;
         }
-        cache::collect_targets_recursive(&chats_dir, "json", &mut targets);
+        let mut project_targets = Vec::new();
+        cache::collect_targets_recursive(&chats_dir, "json", &mut project_targets);
+        // project_dir 派生自旁路的 .project_root：它变化时缓存也必须失效
+        let project_root = entry.path().join(".project_root");
+        for target in &mut project_targets {
+            cache::mix_sibling_into_fingerprint(target, &project_root);
+        }
+        targets.extend(project_targets);
     }
     targets
 }

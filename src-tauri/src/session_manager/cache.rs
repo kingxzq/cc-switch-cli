@@ -84,6 +84,30 @@ pub fn stat_target(path: &Path) -> Option<FileScanTarget> {
     })
 }
 
+/// Mix a sibling dependency's `(mtime, size)` into a target's fingerprint.
+///
+/// Some providers derive parts of `SessionMeta` from files *next to* the
+/// session file (Gemini's `.project_root`, OpenClaw's `sessions.json`
+/// display-name map, OpenCode's per-session message directory). The cache
+/// fingerprint must change when those change too, or the cached row keeps
+/// serving stale derived fields until a manual reload. Missing siblings are
+/// simply not mixed in — their later appearance changes the fingerprint.
+/// Works for directories as well (a directory's mtime changes when entries
+/// are added or removed).
+pub fn mix_sibling_into_fingerprint(target: &mut FileScanTarget, sibling: &Path) {
+    let Ok(meta) = std::fs::metadata(sibling) else {
+        return;
+    };
+    let sibling_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    target.mtime_ns = target.mtime_ns.max(sibling_mtime);
+    target.size = target.size.wrapping_add(meta.len() as i64);
+}
+
 /// Recursively collect files whose extension equals `ext`, statting each once.
 /// Mirrors the directory walks the file scanners already use, but reads only
 /// metadata (readdir + stat) rather than opening file contents.
