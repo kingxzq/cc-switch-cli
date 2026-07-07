@@ -325,10 +325,18 @@ impl ScanCacheStore {
     /// 写入（覆盖）某个文件的字节续传提示。
     pub fn save_sync_resume(&self, hint: &SyncResumeHint) -> Result<(), AppError> {
         let conn = self.lock()?;
+        // 单调更新：并发同步中较晚提交的旧快照不得覆盖较新的提示
         conn.execute(
-            "INSERT OR REPLACE INTO session_sync_resume
+            "INSERT INTO session_sync_resume
                 (file_path, last_modified, last_line_offset, byte_offset, state, tail_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_path) DO UPDATE SET
+                last_modified = excluded.last_modified,
+                last_line_offset = excluded.last_line_offset,
+                byte_offset = excluded.byte_offset,
+                state = excluded.state,
+                tail_hash = excluded.tail_hash
+             WHERE excluded.last_modified >= session_sync_resume.last_modified",
             rusqlite::params![
                 hint.file_path,
                 hint.last_modified,

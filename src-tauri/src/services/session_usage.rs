@@ -700,9 +700,16 @@ pub(crate) fn update_sync_state_conn(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    // 单调更新：并发同步（TUI/daemon/proxy/CLI 可能同时运行）中较晚提交的
+    // 旧快照不得把进度倒退回去——只接受 mtime 不older于现值的写入。
     conn.execute(
-        "INSERT OR REPLACE INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_path) DO UPDATE SET
+            last_modified = excluded.last_modified,
+            last_line_offset = excluded.last_line_offset,
+            last_synced_at = excluded.last_synced_at
+         WHERE excluded.last_modified >= session_log_sync.last_modified",
         rusqlite::params![file_path, last_modified, last_offset, now],
     )
     .map_err(|e| AppError::Database(format!("更新同步状态失败: {e}")))?;
