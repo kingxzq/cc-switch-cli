@@ -31,6 +31,14 @@ For context — the foundations the remaining items build on:
   hand-written (`texts::tui_help_line_*`) for their app-scope prose; the
   static prelude is `texts::tui_help_prelude`. `context_help_for_app` now
   takes `&UiData` to evaluate the keymap labels.
+- **Icon fallback** (`src/cli/tui/icons.rs`): `CC_SWITCH_ICONS=auto|emoji|
+  ascii` env override + a persisted Settings › Icons row, mirroring the
+  color-mode philosophy. `Auto` keeps emoji unless the locale is clearly
+  not UTF-8 (never flips the default when locale info is absent). The nav
+  sidebar collapses its emoji column to zero width in ASCII mode and
+  page/overlay titles strip a leading emoji via `icons::strip_icon`, so
+  wide glyphs can no longer break border alignment on legacy terminals.
+  Also accepts the full-width `？` as the help hotkey.
 - Word-wrapped, message-adaptive dialogs; breadcrumb titles on sub-pages;
   empty-state guidance on empty lists; `? more` degradation for
   overflowing key bars.
@@ -54,43 +62,12 @@ For context — the foundations the remaining items build on:
   These need `render_page_frame` variants (footer slot / info-row slot)
   before they can migrate; not maintenance-only.
 
-### 2. Help sheet generated from the keymap registry (now unblocked)
+Help-sheet generation (was #2) and the icon fallback (was #3, issue #314
+class) are both done — see the Landed section. A possible follow-up on the
+icon work: per-item ASCII nav markers instead of the current text-only
+collapse, if a visible glyph in ASCII mode is wanted.
 
-`texts::tui_help_text*` page-key lines are still hand-written prose. With
-Sessions migrated, the per-page lines can now be generated from
-`keymap::<page>::BINDINGS` (display + label, skipping `shown == never`
-aliases) so dispatch, key bars, and help share one source of truth. The
-static text should keep the global-keys and text-editing sections.
-
-Not as trivial as it looks — scoping notes for whoever picks it up:
-- The label/`shown` fns take `(&App, &UiData)`, but the help entry point
-  `help::context_help_for_app(app)` has no `UiData`; thread `data` in
-  from `App::open_help` (which does have it).
-- A help *catalog* must ignore runtime `shown` state and only drop the
-  `shown == never` aliases (e.g. Usage's Shift+Tab). Add a named sentinel
-  `never(_, _) -> bool` in `keymap` and skip by fn-pointer identity, or
-  add an explicit per-binding "in help" flag — inline `|_, _| false`
-  closures can't be compared.
-- `tui_help_text*` in `i18n.rs` returns `&'static str`; generating means
-  returning `String` and splitting the static global/text-input sections
-  from the per-page bullets.
-- Config/Settings/Hermes-Memory pages have no keymap module, so those
-  bullets stay static. The Hermes help variant differs (provider label,
-  extra Memory line) — the `providers` label fn already varies by
-  app_type, so a generated line should reproduce it for free.
-
-### 3. Terminal compatibility: icon fallback (issue #314 class)
-
-Nav/emoji glyphs (🏠 🔑 …) render double-width on some SSH/legacy
-terminals and break border alignment. Plan:
-
-- `CC_SWITCH_ICONS=ascii|emoji|auto` env override plus a Settings row;
-- `auto`: fall back to ASCII markers when the locale is not UTF-8
-  (`LC_ALL`/`LC_CTYPE`/`LANG` without `utf-8`), mirroring the
-  color-mode philosophy — add per-terminal cases, never flip defaults
-  (see the pinned tests in `theme.rs`).
-
-### 4. Provider form decomposition (largest remaining UX item)
+### 2. Provider form decomposition (largest remaining UX item)
 
 The add/edit form spans ~60 fields across six apps in one scrolling
 table. Plan:
@@ -103,13 +80,13 @@ table. Plan:
 - Sub-pages already show breadcrumbs; also surface a toast when `Ctrl+S`
   is ignored on a sub-page (`form_handlers/mod.rs` refuses silently).
 
-### 5. Command palette (optional, largest discoverability win)
+### 3. Command palette (optional, largest discoverability win)
 
 `Ctrl+P` (or `:`) fuzzy palette over the 24 routes plus per-page intents.
 The `Route` enum and keymap intent tables make the candidate list nearly
 free; the work is the overlay UX and dispatch plumbing.
 
-### 6. Key vocabulary leftovers
+### 4. Key vocabulary leftovers
 
 - Case-pair traps kept for now: Sessions `R` (restore) vs `r` (refresh),
   Skill detail `s` (sync) vs `S` (sync all). If they cause real
@@ -117,7 +94,7 @@ free; the work is the overlay UX and dispatch plumbing.
 - Usage `P` (pricing) vs Main `p` (proxy) cross-screen overload:
   tolerated because both are chip-labeled.
 
-### 7. Upstream housekeeping (not TUI, found along the way)
+### 5. Upstream housekeeping (not TUI, found along the way) — done
 
 - **done** — `.gitignore` `skills/` anchored to `/skills/` so it no
   longer swallows `src/cli/tui/ui/skills/`.
