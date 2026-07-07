@@ -3010,7 +3010,6 @@ fn home_restores_main_logo_and_home_labels() {
     assert!(all.contains("___  ___"));
     assert!(all.contains("\\___|\\___|"));
     assert!(all.contains("Connection Details"));
-    assert!(all.contains("Use the left menu"));
 }
 
 #[test]
@@ -3219,7 +3218,6 @@ fn home_shows_proxy_dashboard_when_current_app_proxy_is_on() {
     assert!(all.contains("┌ Proxy Dashboard "), "{all}");
     assert!(dashboard_idx > local_env_idx, "{all}");
     assert!(!all.contains("___  ___"), "{all}");
-    assert!(all.contains("Use the left menu"), "{all}");
     assert!(traffic_idx < waveform_idx, "{all}");
     assert!(meta_rows.len() <= 2, "{all}");
     assert!(!all.contains("ACTIVE"), "{all}");

@@ -259,7 +259,7 @@ pub(super) fn render_main(
 
     let inner = block.inner(area);
     let content = inset_left(inner, CONTENT_INSET_LEFT);
-    let bottom_hero_height = if current_app_routed { 11 } else { 7 };
+    let bottom_hero_height = if current_app_routed { 10 } else { 6 };
     let connection_card_height = (connection_lines.len() as u16 + 2).max(4);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -282,18 +282,10 @@ pub(super) fn render_main(
     render_webdav_card(frame, top_chunks[2], theme, &webdav_lines, card_border);
     render_local_env_check_card(frame, app, top_chunks[3], theme, card_border);
 
-    let hero_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(chunks[1].height.saturating_sub(1)),
-            Constraint::Length(1),
-        ])
-        .split(chunks[1]);
-
     if current_app_routed {
         render_proxy_activity_dashboard(
             frame,
-            hero_chunks[0],
+            chunks[1],
             theme,
             &app.proxy_input_activity_samples,
             &app.proxy_output_activity_samples,
@@ -307,17 +299,8 @@ pub(super) fn render_main(
             data.proxy.estimated_output_tokens_total,
         );
     } else {
-        render_logo_hero(frame, hero_chunks[0], theme);
+        render_logo_hero(frame, chunks[1], theme);
     }
-
-    // theme.surface as a foreground is nearly invisible on the dark
-    // background; use the muted comment color like other hints.
-    frame.render_widget(
-        Paragraph::new(Line::raw(texts::tui_main_hint()))
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.comment)),
-        hero_chunks[1],
-    );
 }
 
 #[expect(

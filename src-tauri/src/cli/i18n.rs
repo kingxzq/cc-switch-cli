@@ -764,14 +764,6 @@ pub mod texts {
         }
     }
 
-    pub fn tui_main_hint() -> &'static str {
-        if is_chinese() {
-            "使用左侧菜单（↑↓ + Enter）。←→ 在菜单与内容间切换焦点。"
-        } else {
-            "Use the left menu (↑↓ + Enter). ←→ switches focus between menu and content."
-        }
-    }
-
     pub fn tui_header_proxy_status(enabled: bool) -> String {
         if is_chinese() {
             format!("代理: {}", if enabled { "开" } else { "关" })
