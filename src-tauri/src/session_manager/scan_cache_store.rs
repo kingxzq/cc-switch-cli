@@ -30,6 +30,25 @@ pub struct ScanCacheStore {
     conn: Mutex<Connection>,
 }
 
+/// 使用统计增量同步的字节续传提示（存于 sidecar 的 `session_sync_resume` 表）。
+///
+/// 主库 `session_log_sync` 的 `(last_modified, last_line_offset)` 仍是权威进度；
+/// 本提示只是加速手段：`(last_modified, last_line_offset)` 与权威行完全一致时，
+/// 解析器可直接 seek 到 `byte_offset` 续读，免去从字节 0 重读整个文件。任何
+/// 不一致（例如整库从别的机器同步进来、或文件被截断）都应忽略提示回退旧路径。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncResumeHint {
+    pub file_path: String,
+    /// 对应主库 session_log_sync.last_modified 的快照。
+    pub last_modified: i64,
+    /// 对应主库 session_log_sync.last_line_offset 的快照。
+    pub last_line_offset: i64,
+    /// 上次处理完成时的字节位置（与行 offset 语义对齐，含最后一个不完整行）。
+    pub byte_offset: i64,
+    /// 解析器续传状态 JSON（Codex 存整个状态机；Claude 存 session_id）。
+    pub state: Option<String>,
+}
+
 impl ScanCacheStore {
     /// 打开（必要时创建）配置目录下的 sidecar 缓存库。
     pub fn open() -> Result<Self, AppError> {
@@ -83,6 +102,18 @@ impl ScanCacheStore {
             [],
         )
         .map_err(|e| AppError::Database(format!("创建 session_scan_cache 索引失败: {e}")))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_sync_resume (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                state TEXT
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 session_sync_resume 表失败: {e}")))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -248,6 +279,52 @@ impl ScanCacheStore {
         conn.execute(
             "DELETE FROM session_scan_cache WHERE provider = ?1",
             [provider],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 读取某个文件的字节续传提示。
+    pub fn load_sync_resume(&self, file_path: &str) -> Result<Option<SyncResumeHint>, AppError> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT last_modified, last_line_offset, byte_offset, state
+                 FROM session_sync_resume WHERE file_path = ?1",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let hint = stmt
+            .query_row([file_path], |row| {
+                Ok(SyncResumeHint {
+                    file_path: file_path.to_string(),
+                    last_modified: row.get(0)?,
+                    last_line_offset: row.get(1)?,
+                    byte_offset: row.get(2)?,
+                    state: row.get(3)?,
+                })
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(AppError::Database(other.to_string())),
+            })?;
+        Ok(hint)
+    }
+
+    /// 写入（覆盖）某个文件的字节续传提示。
+    pub fn save_sync_resume(&self, hint: &SyncResumeHint) -> Result<(), AppError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO session_sync_resume
+                (file_path, last_modified, last_line_offset, byte_offset, state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                hint.file_path,
+                hint.last_modified,
+                hint.last_line_offset,
+                hint.byte_offset,
+                hint.state,
+            ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
