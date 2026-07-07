@@ -89,9 +89,16 @@ pub(crate) fn scan_sessions_cached(store: &ScanCacheStore, force: bool) -> Vec<S
 }
 
 fn scan_targets() -> Vec<FileScanTarget> {
-    let agents_dir = get_openclaw_dir().join("agents");
+    scan_targets_in(&get_openclaw_dir().join("agents"))
+}
+
+/// 收集 `agents/<agent>/sessions/*.jsonl` 的直属文件。与 `scan_sessions` 一致，
+/// 只扫 `sessions/` 单层目录（用平铺收集器而非递归），嵌套子目录里的文件不纳入
+/// ——否则缓存路径会展示旧路径看不到的文件，且其旁路 `sessions.json` 定位会取错
+/// 目录。
+fn scan_targets_in(agents_dir: &Path) -> Vec<FileScanTarget> {
     let mut targets = Vec::new();
-    let agent_entries = match std::fs::read_dir(&agents_dir) {
+    let agent_entries = match std::fs::read_dir(agents_dir) {
         Ok(entries) => entries,
         Err(_) => return targets,
     };
@@ -101,7 +108,7 @@ fn scan_targets() -> Vec<FileScanTarget> {
             continue;
         }
         let mut agent_targets = Vec::new();
-        cache::collect_targets_recursive(&sessions_dir, "jsonl", &mut agent_targets);
+        cache::collect_targets_flat(&sessions_dir, "jsonl", &mut agent_targets);
         // 标题派生自旁路的 sessions.json 显示名索引：它变化时缓存也必须失效
         let display_names = sessions_dir.join("sessions.json");
         for target in &mut agent_targets {
@@ -442,6 +449,27 @@ fn prune_sessions_index(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn scan_targets_ignores_nested_session_subdirectories() {
+        let temp = tempdir().expect("tempdir");
+        let agents_dir = temp.path();
+        let sessions = agents_dir.join("main").join("sessions");
+        std::fs::create_dir_all(sessions.join("archive")).expect("mkdir");
+        // sessions/ 直属会话文件应被收集
+        std::fs::write(sessions.join("session-1.jsonl"), "{}\n").expect("write");
+        // 嵌套子目录里的会话文件不应被缓存扫描收集
+        std::fs::write(sessions.join("archive").join("session-2.jsonl"), "{}\n").expect("write");
+
+        let targets = scan_targets_in(agents_dir);
+        assert_eq!(targets.len(), 1, "只收集 sessions/ 直属文件");
+        assert!(targets
+            .iter()
+            .any(|t| t.path.file_name().and_then(|n| n.to_str()) == Some("session-1.jsonl")));
+        assert!(!targets
+            .iter()
+            .any(|t| t.path.file_name().and_then(|n| n.to_str()) == Some("session-2.jsonl")));
+    }
 
     #[test]
     fn parse_session_uses_first_user_message_as_title() {

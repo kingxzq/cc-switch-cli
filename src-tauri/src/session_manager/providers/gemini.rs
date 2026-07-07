@@ -69,9 +69,15 @@ pub(crate) fn scan_sessions_cached(store: &ScanCacheStore, force: bool) -> Vec<S
 }
 
 fn scan_targets() -> Vec<FileScanTarget> {
-    let tmp_dir = crate::gemini_config::get_gemini_dir().join("tmp");
+    scan_targets_in(&crate::gemini_config::get_gemini_dir().join("tmp"))
+}
+
+/// 收集 `tmp/<project>/chats/*.json` 的直属文件。与 `scan_sessions` 一致，只扫
+/// `chats/` 单层目录（用平铺收集器而非递归），嵌套子目录里的文件不纳入——否则
+/// 缓存路径会展示旧路径看不到的文件，且其旁路 `.project_root` 定位会取错目录。
+fn scan_targets_in(tmp_dir: &Path) -> Vec<FileScanTarget> {
     let mut targets = Vec::new();
-    let project_dirs = match std::fs::read_dir(&tmp_dir) {
+    let project_dirs = match std::fs::read_dir(tmp_dir) {
         Ok(entries) => entries,
         Err(_) => return targets,
     };
@@ -81,7 +87,7 @@ fn scan_targets() -> Vec<FileScanTarget> {
             continue;
         }
         let mut project_targets = Vec::new();
-        cache::collect_targets_recursive(&chats_dir, "json", &mut project_targets);
+        cache::collect_targets_flat(&chats_dir, "json", &mut project_targets);
         // project_dir 派生自旁路的 .project_root：它变化时缓存也必须失效
         let project_root = entry.path().join(".project_root");
         for target in &mut project_targets {
@@ -315,6 +321,27 @@ mod tests {
         delete_session(temp.path(), &path, "gemini-session-123").expect("delete session");
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn scan_targets_ignores_nested_chat_subdirectories() {
+        let temp = tempdir().expect("tempdir");
+        let tmp_dir = temp.path();
+        let chats = tmp_dir.join("proj").join("chats");
+        std::fs::create_dir_all(chats.join("archive")).expect("mkdir");
+        // chats/ 直属会话文件应被收集
+        std::fs::write(chats.join("session-1.json"), "{}").expect("write");
+        // 嵌套子目录里的会话文件不应被缓存扫描收集
+        std::fs::write(chats.join("archive").join("session-2.json"), "{}").expect("write");
+
+        let targets = scan_targets_in(tmp_dir);
+        assert_eq!(targets.len(), 1, "只收集 chats/ 直属文件");
+        assert!(targets
+            .iter()
+            .any(|t| t.path.file_name().and_then(|n| n.to_str()) == Some("session-1.json")));
+        assert!(!targets
+            .iter()
+            .any(|t| t.path.file_name().and_then(|n| n.to_str()) == Some("session-2.json")));
     }
 
     #[test]

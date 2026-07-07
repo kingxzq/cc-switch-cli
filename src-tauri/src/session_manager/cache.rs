@@ -136,6 +136,29 @@ pub fn collect_targets_recursive(root: &Path, ext: &str, out: &mut Vec<FileScanT
     }
 }
 
+/// Collect files **directly inside** `dir` whose extension equals `ext`, statting
+/// each once. Unlike [`collect_targets_recursive`] this does **not** descend into
+/// subdirectories — it mirrors the single-level `read_dir` walk that some
+/// providers' `scan_sessions` use (Gemini `chats/*.json`, OpenClaw
+/// `sessions/*.jsonl`), so the cache path collects exactly the same files the
+/// legacy path shows. `stat_target` excludes non-regular files, so a directory
+/// whose name happens to end in `.ext` is skipped just like the legacy walk.
+pub fn collect_targets_flat(dir: &Path, ext: &str, out: &mut Vec<FileScanTarget>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        if let Some(target) = stat_target(&path) {
+            out.push(target);
+        }
+    }
+}
+
 /// Reconcile the freshly-`stat`ed `targets` against the `cached` rows.
 ///
 /// A target reuses its cached [`SessionMeta`] only when (unless `force`) its
@@ -434,6 +457,30 @@ mod tests {
         );
         assert!(fourth.is_empty());
         assert!(store.load_for_provider("claude").expect("load").is_empty());
+    }
+
+    /// 平铺收集器只取目录直属文件、不递归子目录，且跳过非目标扩展名。
+    #[test]
+    fn collect_targets_flat_ignores_subdirectories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("archive")).expect("mkdir");
+        // 直属目标文件应被收集
+        std::fs::write(root.join("a.json"), "{}").expect("write");
+        std::fs::write(root.join("b.json"), "{}").expect("write");
+        // 非目标扩展名跳过
+        std::fs::write(root.join("note.txt"), "x").expect("write");
+        // 嵌套子目录里的文件不应被收集
+        std::fs::write(root.join("archive").join("c.json"), "{}").expect("write");
+
+        let mut out = Vec::new();
+        collect_targets_flat(root, "json", &mut out);
+
+        assert_eq!(out.len(), 2, "只收集直属 .json 文件");
+        assert!(out.iter().all(|t| t.path.parent() == Some(root)));
+        assert!(!out
+            .iter()
+            .any(|t| t.path.file_name().and_then(|n| n.to_str()) == Some("c.json")));
     }
 
     #[test]
