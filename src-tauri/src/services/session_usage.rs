@@ -287,7 +287,18 @@ pub(crate) fn spawn_periodic_session_usage_sync(
 async fn run_session_usage_sync_cycle_on_blocking_thread(db: Arc<Database>, context: String) {
     let task_context = context.clone();
     match tokio::task::spawn_blocking(move || {
-        run_session_usage_sync_cycle_best_effort(&db, &task_context);
+        // 周期同步运行在与 daemon/proxy 共享 `Arc<Database>` 的进程里。导入
+        // 优先重开指向同一文件的独立连接：耐久性守卫只降级导入连接（共享
+        // 连接上的 proxy 日志、failover 等权威写入保持 FULL），批量事务也
+        // 不会经由进程内 mutex 阻塞共享连接的读写。重开失败（内存库测试
+        // 环境等）回退共享连接。
+        match db.reopen_for_import() {
+            Ok(import_db) => run_session_usage_sync_cycle_best_effort(&import_db, &task_context),
+            Err(error) => {
+                log::debug!("独立导入连接打开失败，回退共享连接 ({task_context}): {error}");
+                run_session_usage_sync_cycle_best_effort(&db, &task_context);
+            }
+        }
     })
     .await
     {
@@ -700,16 +711,9 @@ pub(crate) fn update_sync_state_conn(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // 单调更新：并发同步（TUI/daemon/proxy/CLI 可能同时运行）中较晚提交的
-    // 旧快照不得把进度倒退回去——只接受 mtime 不older于现值的写入。
     conn.execute(
-        "INSERT INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(file_path) DO UPDATE SET
-            last_modified = excluded.last_modified,
-            last_line_offset = excluded.last_line_offset,
-            last_synced_at = excluded.last_synced_at
-         WHERE excluded.last_modified >= session_log_sync.last_modified",
+        "INSERT OR REPLACE INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
+         VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![file_path, last_modified, last_offset, now],
     )
     .map_err(|e| AppError::Database(format!("更新同步状态失败: {e}")))?;

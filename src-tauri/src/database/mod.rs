@@ -762,4 +762,28 @@ impl Database {
         }
         BulkImportDurabilityGuard { db: self }
     }
+
+    /// 为批量导入重开一个指向同一数据库文件的独立连接。
+    ///
+    /// 周期同步运行在与 daemon/proxy 共享 `Database` 的进程里：导入走独立
+    /// 连接，耐久性守卫就只降级导入侧（共享连接上的 proxy 日志、failover
+    /// 等权威写入保持 FULL），批量事务也不会经进程内 mutex 阻塞共享连接。
+    /// 内存库（测试）没有文件路径，返回 Err，调用方回退共享连接。
+    pub(crate) fn reopen_for_import(&self) -> Result<Self, AppError> {
+        let Some(db_path) = self.db_path.clone() else {
+            return Err(AppError::Database(
+                "内存数据库无法重开独立导入连接".to_string(),
+            ));
+        };
+        let conn = Connection::open_with_flags(&db_path, database_open_flags())
+            .map_err(|e| AppError::Database(format!("重开数据库连接失败: {e}")))?;
+        Self::configure_connection(&conn)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            runtime_key: self.runtime_key.clone(),
+            db_path: Some(db_path),
+        })
+    }
 }
