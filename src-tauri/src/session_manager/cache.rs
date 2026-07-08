@@ -174,17 +174,29 @@ pub fn collect_targets_flat(dir: &Path, ext: &str, out: &mut Vec<FileScanTarget>
 /// serve a stale summary indefinitely. An uncacheable row still enters the
 /// returned list but is never upserted, and any pre-existing cached row for its
 /// path is deleted so the next scan re-parses it instead of hitting a stale row.
-pub fn revalidate<F, C>(
+///
+/// `restat` re-`stat`s a target's path just before its parse result is written
+/// (fix 3). Production passes [`stat_target`]; only when the re-stat still returns
+/// the *same* `(mtime_ns, size)` as the pre-parse target is the row upserted. This
+/// closes a delete/rewrite race: a TUI scan thread that read a session the user
+/// then deleted (its sidecar row already purged) must not upsert the stale row
+/// back — otherwise a later restart's stale first-paint snapshot resurrects the
+/// deleted session. A re-stat that vanished or changed skips the upsert and, by
+/// not entering `keep`, lets any pre-existing cache row for that path be deleted;
+/// the file is reprocessed on the next scan.
+pub fn revalidate<F, C, R>(
     provider: &str,
     targets: Vec<FileScanTarget>,
     cached: HashMap<String, CachedScanRow>,
     force: bool,
     parse: F,
     cacheable: C,
+    restat: R,
 ) -> ScanDelta
 where
     F: Fn(&Path) -> Option<SessionMeta> + Sync,
     C: Fn(&SessionMeta) -> bool + Sync,
+    R: Fn(&Path) -> Option<FileScanTarget>,
 {
     let mut sessions = Vec::new();
     let mut keep: HashSet<String> = HashSet::new();
@@ -234,15 +246,30 @@ where
         let Ok(meta_json) = serde_json::to_string(&meta) else {
             continue;
         };
-        keep.insert(key.clone());
-        upserts.push(SessionScanCacheEntry {
-            file_path: key,
-            provider: provider.to_string(),
-            mtime_ns: target.mtime_ns,
-            size: target.size,
-            meta_json,
-            cache_version: SCAN_CACHE_VERSION,
-        });
+        // fix 3：upsert 前对该文件再 stat 一次，关闭 parse 期间的删除/改写竞态。
+        // 仅当文件仍在、且 (mtime_ns, size) 与 parse 前完全一致时才写缓存；否则
+        // 跳过 upsert 且不进 keep（其旧缓存行由末尾 filter 纳入 deletes），下轮
+        // 重新处理该文件。这样在途扫描线程不会把已删/已改文件的旧 row 写回
+        // sidecar，避免重启后 stale 首屏快照复活已删会话。仍把已解析的 meta 放入
+        // 返回列表（本轮 UI 由内存 tombstone 过滤已删会话；此处只管缓存不被污染）。
+        match restat(&target.path) {
+            Some(fresh) if fresh.mtime_ns == target.mtime_ns && fresh.size == target.size => {
+                keep.insert(key.clone());
+                upserts.push(SessionScanCacheEntry {
+                    file_path: key,
+                    provider: provider.to_string(),
+                    mtime_ns: target.mtime_ns,
+                    size: target.size,
+                    meta_json,
+                    cache_version: SCAN_CACHE_VERSION,
+                });
+            }
+            _ => {
+                log::debug!(
+                    "[SESSION-SCAN] provider={provider} re-stat 失配，跳过 upsert（旧缓存行将删除）: {key}"
+                );
+            }
+        }
         sessions.push(meta);
     }
 
@@ -317,7 +344,16 @@ where
 
     let target_count = targets.len();
     let cached_count = cached.len();
-    let delta = revalidate(provider, targets, cached, force, parse, cacheable);
+    // fix 3：生产侧用真实 stat_target 做 upsert 前的 re-stat（关闭 parse 期间竞态）。
+    let delta = revalidate(
+        provider,
+        targets,
+        cached,
+        force,
+        parse,
+        cacheable,
+        stat_target,
+    );
     log::debug!(
         "[SESSION-SCAN] provider={provider} targets={target_count} cached={cached_count} \
          reparsed={} deleted={} uncacheable={} force={force} elapsed={:?}",
@@ -540,6 +576,17 @@ mod tests {
         }
     }
 
+    /// fix 3 测试辅助：模拟"parse 期间文件未变"的 re-stat——按路径回显传入 targets
+    /// 的 `(mtime_ns, size)`。用于以假路径断言 upsert 的既有用例，使 re-stat 恒命中、
+    /// 保持既有语义（未知路径回 None，与真实文件消失一致）。
+    fn echoing_restat(targets: &[FileScanTarget]) -> impl Fn(&Path) -> Option<FileScanTarget> {
+        let map: HashMap<PathBuf, FileScanTarget> = targets
+            .iter()
+            .map(|t| (t.path.clone(), t.clone()))
+            .collect();
+        move |p: &Path| map.get(p).cloned()
+    }
+
     #[test]
     fn session_meta_json_roundtrip_is_identity() {
         let meta = sample_meta("abc");
@@ -586,9 +633,11 @@ mod tests {
         );
 
         let parsed = std::sync::atomic::AtomicUsize::new(0);
+        let all_targets = vec![unchanged, changed];
+        let restat = echoing_restat(&all_targets);
         let delta = revalidate(
             "claude",
-            vec![unchanged, changed],
+            all_targets,
             cached,
             false,
             |path| {
@@ -596,6 +645,7 @@ mod tests {
                 Some(sample_meta(path.file_stem().unwrap().to_str().unwrap()))
             },
             |_| true,
+            restat,
         );
 
         // Only the changed file is parsed; the unchanged one is a cache hit.
@@ -623,13 +673,16 @@ mod tests {
             cached_row(&present, &sample_meta("gone"), SCAN_CACHE_VERSION),
         );
 
+        let all_targets = vec![present];
+        let restat = echoing_restat(&all_targets);
         let delta = revalidate(
             "claude",
-            vec![present],
+            all_targets,
             cached,
             false,
             |_| Some(sample_meta("a")),
             |_| true,
+            restat,
         );
 
         assert_eq!(delta.deletes, vec!["/tmp/gone.jsonl".to_string()]);
@@ -651,9 +704,11 @@ mod tests {
         );
 
         let parsed = std::sync::atomic::AtomicUsize::new(0);
+        let all_targets = vec![target];
+        let restat = echoing_restat(&all_targets);
         let delta = revalidate(
             "claude",
-            vec![target],
+            all_targets,
             cached,
             false,
             |_| {
@@ -661,6 +716,7 @@ mod tests {
                 Some(sample_meta("a"))
             },
             |_| true,
+            restat,
         );
 
         assert_eq!(parsed.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -683,9 +739,11 @@ mod tests {
         );
 
         let parsed = std::sync::atomic::AtomicUsize::new(0);
+        let all_targets = vec![target];
+        let restat = echoing_restat(&all_targets);
         let delta = revalidate(
             "claude",
-            vec![target],
+            all_targets,
             cached,
             true,
             |_| {
@@ -693,6 +751,7 @@ mod tests {
                 Some(sample_meta("a"))
             },
             |_| true,
+            restat,
         );
 
         // Even an mtime/size match is ignored under `force`.
@@ -768,9 +827,12 @@ mod tests {
         );
 
         let parsed = AtomicUsize::new(0);
+        let all_targets = vec![target];
+        // 不可缓存行在 restat 之前就 continue，restat 不会被调用；传回显版即可。
+        let restat = echoing_restat(&all_targets);
         let delta = revalidate(
             "opencode",
-            vec![target],
+            all_targets,
             cached,
             false,
             |_| {
@@ -778,6 +840,7 @@ mod tests {
                 Some(sample_meta("a"))
             },
             |_| false,
+            restat,
         );
 
         assert_eq!(
@@ -793,5 +856,48 @@ mod tests {
         );
         assert_eq!(delta.sessions.len(), 1, "仍进返回列表");
         assert_eq!(delta.uncacheable, 1, "观测计数");
+    }
+
+    /// fix 3：parse 期间文件被删除（re-stat 返回 None）时，不 upsert 该文件，且其
+    /// 遗留缓存行进 deletes——在途扫描线程不会把已删文件的旧 row 写回 sidecar。
+    #[test]
+    fn revalidate_reparse_then_deleted_skips_upsert_and_deletes_old_row() {
+        let target = FileScanTarget {
+            path: PathBuf::from("/tmp/gone-mid-parse.jsonl"),
+            mtime_ns: 100,
+            size: 10,
+        };
+        let key = "/tmp/gone-mid-parse.jsonl".to_string();
+        // (mtime,size) 与当前 target 不同的遗留缓存行 → 该文件进 to_parse。
+        let mut cached = HashMap::new();
+        cached.insert(
+            key.clone(),
+            CachedScanRow {
+                mtime_ns: 1,
+                size: 1,
+                cache_version: SCAN_CACHE_VERSION,
+                meta_json: serde_json::to_string(&sample_meta("old")).unwrap(),
+            },
+        );
+
+        let delta = revalidate(
+            "claude",
+            vec![target],
+            cached,
+            false,
+            // parse 成功（返回 meta），但文件在 re-stat 时已消失。
+            |_| Some(sample_meta("new")),
+            |_| true,
+            // 注入的 re-stat 返回 None，模拟 parse 期间文件被删除的竞态。
+            |_| None,
+        );
+
+        assert!(delta.upserts.is_empty(), "re-stat 失配 → 不 upsert");
+        assert!(
+            delta.deletes.contains(&key),
+            "遗留缓存行进 deletes（不被在途线程写回）"
+        );
+        // 已解析的 meta 仍进返回列表（本轮 UI 由内存 tombstone 过滤已删会话）。
+        assert_eq!(delta.sessions.len(), 1);
     }
 }
