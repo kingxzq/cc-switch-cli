@@ -125,14 +125,24 @@ apps can be added without re-inventing the machinery:
 - **Authoritative progress** stays in cc-switch.db's `session_log_sync`
   (`last_modified` + `last_line_offset`, upstream-compatible shape).
 - **Acceleration hints** live in the sidecar (`session_sync_resume`):
-  per-file byte offset plus a serialized parser state and a tail fingerprint
-  (FNV-1a over the ≤64 bytes before the offset). A hint is honored only when
-  its `(last_modified, last_line_offset)` snapshot exactly matches the
-  authoritative row, the file has not shrunk, and the tail fingerprint still
-  matches the file's bytes — the fingerprint catches a same-path rewrite to
-  a *larger* file, which size/mtime checks cannot. Any mismatch (database
-  synced in from another machine, rotated file, missing hint) falls back to
-  today's read-from-zero line-counted pass and records a fresh hint.
+  per-file byte offset plus a serialized parser state, a Unix inode identity,
+  and a tail fingerprint (FNV-1a over the ≤64 bytes before the offset). A hint
+  is honored only when its `(last_modified, last_line_offset)` snapshot exactly
+  matches the authoritative row, the file has not shrunk, the recorded Unix
+  inode still matches, and the tail fingerprint still matches the file's bytes.
+  The inode check closes rename-replace rewrites and cross-machine same-path
+  files (a different physical file at the same path has a different inode); it
+  is skipped when the hint predates this column or the platform is non-Unix.
+  The tail fingerprint is an **append-only heuristic, not a strict guarantee**:
+  it only identifies an in-place rewrite that changed the ≤64 bytes before the
+  offset (inode unchanged) — an in-place truncate+rewrite to a *larger* file
+  whose first bytes happen to be byte-identical would slip past both the
+  size/mtime checks and the fingerprint. That case is effectively unreachable
+  for session logs (each JSONL line is an independent record and log apps only
+  append, never rewrite their own history), so we deliberately do not chase a
+  perfect cross-platform scheme. Any mismatch (database synced in from another
+  machine, rotated file, changed inode, missing hint) falls back to today's
+  read-from-zero line-counted pass and records a fresh hint.
 - **Persisted progress stops at the last newline boundary.** A trailing line
   without a newline is still fed to the parser (a finished file's last line
   may legitimately never get one) but is not counted into

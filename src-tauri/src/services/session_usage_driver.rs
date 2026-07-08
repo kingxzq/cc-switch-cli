@@ -12,10 +12,19 @@
 //! 进度契约：主库 `session_log_sync` 的 `(last_modified, last_line_offset)`
 //! 是权威进度（schema 与上游同步，不可扩展）；sidecar 的
 //! `session_sync_resume` 只是加速提示，校验分三档（见 [`ResumeDecision`]）：
-//! 快照与权威行一致且尾部指纹吻合 → 续传；截断/指纹失配证明同路径文件被
-//! 重写 → 忽略旧行 offset 全量重扫（去重兜底）；无提示或提示与权威行不符
-//! （首次运行、整库从别的机器 WebDAV 同步进来等）→ 回退到从字节 0 按行
-//! offset 跳过的旧路径。本轮结束后写回新提示。
+//! 快照与权威行一致、Unix inode 未变、尾部指纹吻合 → 续传；截断 / Unix inode
+//! 变化 / 指纹失配 → 忽略旧行 offset 全量重扫（去重兜底）；无提示或提示与
+//! 权威行不符（首次运行、整库从别的机器 WebDAV 同步进来等）→ 回退到从字节
+//! 0 按行 offset 跳过的旧路径。本轮结束后写回新提示。
+//!
+//! 文件身份校验的边界（诚实化）：Unix inode（`file_identity`）关闭
+//! rename-replace 类重写与跨机器同步进来的异源文件——inode 变了即证明这已
+//! 不是权威 offset 描述的那个文件。原地 `truncate+rewrite`（inode 不变；会话
+//! 日志 app 不会这样重写自己的历史文件）仍靠 ≤64B 尾部指纹（`tail_hash`）
+//! 这一 append-only 假设下的启发式识别，**非严格保证**：若文件被整体重写成
+//! 更大文件、而旧 offset 前 64 字节恰好逐字节不变，则识别不出。现实触发概率
+//! 极低（JSONL 每行独立 JSON、日志 app 只追加不改历史），故不追求跨平台完美
+//! 方案。
 //!
 //! 非 JSONL 数据源（Gemini 整文件 JSON、OpenCode 外部 SQLite）天然无法按
 //! 字节续传，仅遵循 mtime 跳过契约，不经过本驱动。
@@ -107,9 +116,11 @@ fn load_matching_resume_hint(
 enum ResumeDecision<S> {
     /// 提示完整有效：从 `byte_offset` 续读，恢复状态机。
     Resume { byte_offset: u64, state: S },
-    /// 有确凿证据表明同路径文件已被重写（截断、或续传边界前的内容指纹
-    /// 失配）：权威行 offset 描述的是旧文件，必须忽略它从头全量重扫，
-    /// 各 app 的 request_id 去重保证重扫不会重复入库。
+    /// 有证据表明这已不是权威 offset 描述的那个文件：截断（size < offset）、
+    /// Unix inode 变化（rename-replace 类重写、跨机器同步进来的异源文件），
+    /// 或续传边界前的 ≤64B 内容指纹失配（append-only 假设下识破原地重写的
+    /// 启发式，非严格保证）：权威行 offset 描述的是旧文件，必须忽略它从头
+    /// 全量重扫，各 app 的 request_id 去重保证重扫不会重复入库。
     RescanFromZero,
     /// 无提示或提示与权威行不符（首次运行、整库从别的机器同步进来、
     /// 提示状态无法反序列化等）：没有身份失效的证据，沿用旧的
@@ -138,6 +149,27 @@ fn decide_resume<S: DeserializeOwned>(
         );
         return ResumeDecision::RescanFromZero;
     }
+
+    // Unix inode 身份校验（在尾部指纹之前）：提示带 inode、且能取到当前文件
+    // inode、且两者不同 → rename-replace 类重写或跨机器同步进来的异源文件，
+    // 权威 offset 描述的是旧文件，一票否决全量重扫。提示无 inode（旧提示 /
+    // 非 Unix）或取不到当前 inode 时跳过本校验，维持既有 tail_hash 启发式
+    // （不放宽也不收紧）。
+    let identity_changed = match hint.file_identity {
+        Some(expected_identity) => file
+            .metadata()
+            .ok()
+            .and_then(|m| file_identity(&m))
+            .is_some_and(|current| current != expected_identity),
+        None => false,
+    };
+    if identity_changed {
+        log::debug!(
+            "[SYNC-DRIVER] 文件 inode 变化（rename-replace/跨机器异源），全量重扫: {file_path}"
+        );
+        return ResumeDecision::RescanFromZero;
+    }
+
     // 旧版提示无指纹：既不能证实也不能证伪身份，保守走行 offset 路径
     let Some(expected) = hint.tail_hash else {
         log::debug!("[SYNC-DRIVER] 提示缺尾部指纹，回退行 offset 路径: {file_path}");
@@ -183,6 +215,21 @@ fn decide_resume<S: DeserializeOwned>(
             ResumeDecision::LineSkipFallback
         }
     }
+}
+
+/// 跨平台文件身份：Unix 返回 inode（`ino() as i64`，位模式保留、允许负值），
+/// 其他平台返回 None。inode 变化即证明同路径下已换成不同的物理文件
+/// （rename-replace 类重写、跨机器同步进来的异源文件），据此可在续传前一票
+/// 否决权威 offset。原地 `truncate+rewrite` 不改 inode，不在本校验覆盖内。
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.ino() as i64)
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<i64> {
+    None
 }
 
 /// 读取文件 `byte_pos` 前的尾部窗口指纹（保存提示时使用）。对 append-only
@@ -471,6 +518,11 @@ pub(crate) fn save_resume_hint(
         // 收敛 outcome 携带 None：写回 NULL 清空待确认尾部；下轮不再复查。
         pending_tail_len: outcome.pending_tail_len,
         pending_tail_hash: outcome.pending_tail_hash,
+        // 记录当前文件 inode（Unix；其他平台 None）：下轮续传前比对，inode 变了
+        // 即 rename-replace 类重写 / 跨机器异源文件，忽略旧 offset 全量重扫。
+        file_identity: fs::metadata(file_path_str)
+            .ok()
+            .and_then(|m| file_identity(&m)),
     };
     if let Err(err) = store.save_sync_resume(&hint) {
         log::debug!("[SESSION-SYNC] 写入字节续传提示失败 ({file_path_str}): {err}");
@@ -908,5 +960,105 @@ mod tests {
         // 新文件的行以 is_new=true 全量重放，不会被旧行 offset 误跳
         assert_eq!(second.seen, vec![("x".to_string(), true)]);
         assert_eq!(second.out().line_offset, 1);
+    }
+
+    /// 修复 1：Unix inode 变化（rename-replace 类重写 / 跨机器同步进来的异源
+    /// 文件）在 tail_hash 之前触发全量重扫。构造方式：首轮扫描后 save 提示
+    /// （记录真实 inode），再把提示的 file_identity 篡改成一个与真实 inode 保证
+    /// 不同的值（`^ 1` 翻转最低位）——等价于同路径换了一个 inode。append 新行
+    /// 后文件本体 inode 未变、前缀字节不变（tail_hash 本会命中并只读新行），
+    /// 但提示 inode 已失配 → inode 校验优先触发全量重扫（所有行 is_new=true）。
+    /// 非 Unix 平台 file_identity 恒为 None，本校验不适用，故 gate 掉。
+    #[cfg(unix)]
+    #[test]
+    fn changed_inode_triggers_rescan_from_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "l1\nl2\n").expect("write");
+        let store = ScanCacheStore::in_memory().expect("store");
+
+        let first = scan_at(&path, 1_000, 0, 0, Some(&store));
+        assert_eq!(first.out().byte_pos, 6);
+        save_resume_hint(Some(&store), &path.to_string_lossy(), first.out());
+
+        // 提示已记录真实 inode；篡改成保证不同的值模拟 inode 变化
+        let mut hint = store
+            .load_sync_resume(&path.to_string_lossy())
+            .expect("load")
+            .expect("hint");
+        let real_inode = hint.file_identity.expect("unix 应记录 inode");
+        hint.file_identity = Some(real_inode ^ 1);
+        store.save_sync_resume(&hint).expect("save tampered");
+
+        // append-only 追加新行：本体 inode 不变、前缀不变（tail_hash 会命中），
+        // 唯有提示的 file_identity 已失配
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"l3\n")
+            .unwrap();
+
+        let second = scan_at(
+            &path,
+            2_000,
+            first.out().file_modified,
+            first.out().line_offset,
+            Some(&store),
+        );
+        // inode 失配在 tail_hash 之前一票否决 → 全量重扫，所有行 is_new=true
+        assert_eq!(
+            second.seen,
+            vec![
+                ("l1".to_string(), true),
+                ("l2".to_string(), true),
+                ("l3".to_string(), true)
+            ]
+        );
+        assert_eq!(second.out().line_offset, 3);
+    }
+
+    /// 修复 1 回归：旧提示 `file_identity == None`（升级前写入 / 非 Unix）时
+    /// inode 校验跳过，续传行为与本修复前完全一致——append 新行、前缀字节不变，
+    /// tail_hash 命中，只读新行。全平台适用（显式清空 file_identity）。
+    #[test]
+    fn legacy_hint_without_file_identity_still_resumes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "l1\nl2\n").expect("write");
+        let store = ScanCacheStore::in_memory().expect("store");
+
+        let first = scan_at(&path, 1_000, 0, 0, Some(&store));
+        save_resume_hint(Some(&store), &path.to_string_lossy(), first.out());
+
+        // 清空 file_identity，模拟升级前的旧提示（或非 Unix 平台）
+        let mut hint = store
+            .load_sync_resume(&path.to_string_lossy())
+            .expect("load")
+            .expect("hint");
+        hint.file_identity = None;
+        store.save_sync_resume(&hint).expect("save legacy");
+
+        // append 新行，前缀字节不变 → tail_hash 命中，续传只读新行
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"l3\n")
+            .unwrap();
+
+        let second = scan_at(
+            &path,
+            2_000,
+            first.out().file_modified,
+            first.out().line_offset,
+            Some(&store),
+        );
+        assert_eq!(
+            second.seen,
+            vec![("l3".to_string(), true)],
+            "无 file_identity 时应沿用 tail_hash 续传，只读新行"
+        );
+        assert_eq!(second.out().line_offset, 3);
     }
 }

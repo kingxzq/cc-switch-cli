@@ -34,9 +34,10 @@ pub struct ScanCacheStore {
 ///
 /// 主库 `session_log_sync` 的 `(last_modified, last_line_offset)` 仍是权威进度；
 /// 本提示只是加速手段：`(last_modified, last_line_offset)` 与权威行完全一致、
-/// 且 `byte_offset` 前的尾部字节指纹（`tail_hash`）与文件当前内容吻合时，
-/// 解析器才直接 seek 到 `byte_offset` 续读。任何不一致（整库从别的机器同步
-/// 进来、文件被截断、同路径整体重写）都应忽略提示回退旧路径。
+/// Unix inode（`file_identity`）未变、且 `byte_offset` 前的尾部字节指纹
+/// （`tail_hash`）与文件当前内容吻合时，解析器才直接 seek 到 `byte_offset`
+/// 续读。任何不一致（整库从别的机器同步进来、文件被截断、inode 变化的
+/// rename-replace 类重写）都应忽略提示回退旧路径。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncResumeHint {
     pub file_path: String,
@@ -48,8 +49,11 @@ pub struct SyncResumeHint {
     pub byte_offset: i64,
     /// 解析器续传状态 JSON（Codex 存整个状态机；Claude 存 session_id）。
     pub state: Option<String>,
-    /// `byte_offset` 前至多 64 字节的 FNV-1a 指纹：识别"同路径被整体重写成
-    /// 更大文件"的轮转场景（size/mtime 校验无法覆盖）。None 视为提示无效。
+    /// `byte_offset` 前至多 64 字节的 FNV-1a 指纹。**append-only 假设下**的
+    /// 内容边界校验：只能识破"边界前 64 字节发生变化"的原地重写；若文件被
+    /// 整体重写成更大文件、而旧 offset 前 64 字节恰好逐字节不变，则识别不出
+    /// （非严格保证，会话日志 app 不会原地重写自己的历史）。inode 变化的
+    /// rename-replace 类重写另由 `file_identity` 关闭。None 视为无指纹。
     pub tail_hash: Option<i64>,
     /// 上轮结束时"边界之后未终结尾部"的字节数（None = 无待确认尾部）。
     /// 与 `pending_tail_hash` 一起做尾部稳定性确认：对"永远不带换行的最终
@@ -57,6 +61,12 @@ pub struct SyncResumeHint {
     pub pending_tail_len: Option<i64>,
     /// 上轮未终结尾部（`byte_offset`→EOF）字节的 FNV-1a 指纹。
     pub pending_tail_hash: Option<i64>,
+    /// 保存提示时文件的身份标识：Unix 存 inode（`ino() as i64`，位模式保留、
+    /// 允许负值），其他平台存 None。续传前若当前文件 inode 与此不同，说明这
+    /// 已不是权威 offset 描述的那个文件（rename-replace 类重写、跨机器同步
+    /// 进来的异源文件）→ 全量重扫。None（旧提示/非 Unix）时该校验跳过，退回
+    /// tail_hash 启发式。
+    pub file_identity: Option<i64>,
 }
 
 impl ScanCacheStore {
@@ -132,7 +142,8 @@ impl ScanCacheStore {
                 state TEXT,
                 tail_hash INTEGER,
                 pending_tail_len INTEGER,
-                pending_tail_hash INTEGER
+                pending_tail_hash INTEGER,
+                file_identity INTEGER
             )",
             [],
         )
@@ -148,6 +159,10 @@ impl ScanCacheStore {
         );
         let _ = conn.execute(
             "ALTER TABLE session_sync_resume ADD COLUMN pending_tail_hash INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE session_sync_resume ADD COLUMN file_identity INTEGER",
             [],
         );
 
@@ -348,7 +363,7 @@ impl ScanCacheStore {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT last_modified, last_line_offset, byte_offset, state, tail_hash,
-                        pending_tail_len, pending_tail_hash
+                        pending_tail_len, pending_tail_hash, file_identity
                  FROM session_sync_resume WHERE file_path = ?1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -363,6 +378,7 @@ impl ScanCacheStore {
                     tail_hash: row.get(4)?,
                     pending_tail_len: row.get(5)?,
                     pending_tail_hash: row.get(6)?,
+                    file_identity: row.get(7)?,
                 })
             })
             .map(Some)
@@ -382,8 +398,8 @@ impl ScanCacheStore {
         conn.execute(
             "INSERT INTO session_sync_resume
                 (file_path, last_modified, last_line_offset, byte_offset, state, tail_hash,
-                 pending_tail_len, pending_tail_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 pending_tail_len, pending_tail_hash, file_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(file_path) DO UPDATE SET
                 last_modified = excluded.last_modified,
                 last_line_offset = excluded.last_line_offset,
@@ -391,7 +407,8 @@ impl ScanCacheStore {
                 state = excluded.state,
                 tail_hash = excluded.tail_hash,
                 pending_tail_len = excluded.pending_tail_len,
-                pending_tail_hash = excluded.pending_tail_hash
+                pending_tail_hash = excluded.pending_tail_hash,
+                file_identity = excluded.file_identity
              WHERE excluded.last_modified > session_sync_resume.last_modified
                 OR (excluded.last_modified = session_sync_resume.last_modified
                     AND excluded.byte_offset >= session_sync_resume.byte_offset)",
@@ -404,6 +421,7 @@ impl ScanCacheStore {
                 hint.tail_hash,
                 hint.pending_tail_len,
                 hint.pending_tail_hash,
+                hint.file_identity,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -658,6 +676,7 @@ mod tests {
             tail_hash: Some(1),
             pending_tail_len: None,
             pending_tail_hash: None,
+            file_identity: None,
         };
 
         store.save_sync_resume(&hint(5, 120)).expect("save");
@@ -691,6 +710,7 @@ mod tests {
             tail_hash: Some(7),
             pending_tail_len: Some(5),
             pending_tail_hash: Some(1234),
+            file_identity: Some(9988),
         };
         store.save_sync_resume(&hint).expect("save");
         let loaded = store
@@ -699,6 +719,11 @@ mod tests {
             .expect("hint");
         assert_eq!(loaded.pending_tail_len, Some(5));
         assert_eq!(loaded.pending_tail_hash, Some(1234));
+        assert_eq!(
+            loaded.file_identity,
+            Some(9988),
+            "file_identity 应随提示往返"
+        );
 
         // 收敛写回：更大的 mtime 覆盖，pending_tail 清空为 NULL。
         let cleared = SyncResumeHint {
