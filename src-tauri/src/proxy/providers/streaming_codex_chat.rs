@@ -425,11 +425,15 @@ impl ChatToResponsesState {
 
         {
             let state = self.tools.entry(chat_index).or_default();
-            if let Some(id) = id_delta {
-                state.call_id = id;
+            if let Some(ref id) = id_delta {
+                if !id.is_empty() {
+                    state.call_id.clone_from(id);
+                }
             }
-            if let Some(name) = name_delta {
-                state.name = name;
+            if let Some(ref name) = name_delta {
+                if !name.is_empty() {
+                    state.name.clone_from(name);
+                }
             }
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
@@ -441,7 +445,7 @@ impl ChatToResponsesState {
                 }
             }
 
-            if !state.added && (!state.call_id.is_empty() || !state.name.is_empty()) {
+            if !state.added && !state.call_id.is_empty() && !state.name.is_empty() {
                 should_add = true;
                 pending_arguments = state.arguments.clone();
             } else if state.added {
@@ -462,9 +466,6 @@ impl ChatToResponsesState {
             state.added = true;
             if state.call_id.is_empty() {
                 state.call_id = format!("call_{chat_index}");
-            }
-            if state.name.is_empty() {
-                state.name = "unknown_tool".to_string();
             }
             state.output_index = Some(assigned);
             let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&state.name);
@@ -696,6 +697,20 @@ impl ChatToResponsesState {
                 continue;
             }
 
+            // Some providers emit tool-call deltas without ever supplying a name.
+            let has_bad_name = self
+                .tools
+                .get(&key)
+                .map(|state| state.name.is_empty())
+                .unwrap_or(true);
+            if has_bad_name {
+                if let Some(state) = self.tools.get_mut(&key) {
+                    state.done = true;
+                }
+                log::warn!("[Codex] Skipping streaming tool call with missing name");
+                continue;
+            }
+
             if self
                 .tools
                 .get(&key)
@@ -709,9 +724,6 @@ impl ChatToResponsesState {
                 state.added = true;
                 if state.call_id.is_empty() {
                     state.call_id = format!("call_{key}");
-                }
-                if state.name.is_empty() {
-                    state.name = "unknown_tool".to_string();
                 }
                 state.output_index = Some(assigned);
                 state.item_id = response_tool_call_item_id_from_chat_name(
@@ -1030,6 +1042,16 @@ mod tests {
         String::from_utf8(bytes.concat()).unwrap()
     }
 
+    fn parse_sse_events(output: &str) -> Vec<Value> {
+        output
+            .split("\n\n")
+            .filter_map(|block| {
+                let data = block.lines().find_map(|line| line.strip_prefix("data: "))?;
+                serde_json::from_str(data).ok()
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn converts_text_chat_sse_to_responses_sse() {
         let output = collect(vec![
@@ -1100,6 +1122,113 @@ mod tests {
         assert!(output.contains("event: response.function_call_arguments.done"));
         assert!(output.contains("\"type\":\"function_call\""));
         assert!(output.contains("\"call_id\":\"call_1\""));
+    }
+
+    #[tokio::test]
+    async fn preserves_tool_identity_across_empty_continuation_deltas() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_dashscope\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_dashscope\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_dashscope\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"\",\"arguments\":\"\\\"cmd\\\":\\\"date\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let added = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .collect::<Vec<_>>();
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+
+        assert_eq!(added.len(), 1);
+        for item in [&done["item"], &completed["response"]["output"][0]] {
+            assert_eq!(item["type"], "function_call");
+            assert_eq!(item["name"], "exec_command");
+            assert_eq!(item["call_id"], "call_dashscope");
+            assert_eq!(item["arguments"], r#"{"cmd":"date"}"#);
+        }
+        assert!(!output.contains("unknown_tool"));
+        assert!(!output.contains(r#""name":"""#));
+        assert!(!output.contains(r#""call_id":"""#));
+    }
+
+    #[tokio::test]
+    async fn waits_for_tool_name_before_adding_streaming_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_late_name\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late\",\"type\":\"function\",\"function\":{\"name\":\"\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_late_name\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let added = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .collect::<Vec<_>>();
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let item = &completed["response"]["output"][0];
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(item["name"], "read_file");
+        assert_eq!(item["call_id"], "call_late");
+        assert_eq!(item["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[tokio::test]
+    async fn waits_for_tool_id_before_adding_streaming_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_late_id\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_late_id\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let added = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .collect::<Vec<_>>();
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let item = &completed["response"]["output"][0];
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(item["name"], "read_file");
+        assert_eq!(item["call_id"], "call_late");
+        assert_eq!(item["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[tokio::test]
+    async fn skips_streaming_tool_call_that_never_gets_name() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_no_name\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_no_name\",\"type\":\"function\",\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"date\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        let events = parse_sse_events(&output);
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+
+        assert!(!events
+            .iter()
+            .any(|event| event["type"] == "response.output_item.added"));
+        assert!(!events
+            .iter()
+            .any(|event| event["type"] == "response.output_item.done"));
+        assert_eq!(completed["response"]["output"], json!([]));
+        assert!(!output.contains("unknown_tool"));
     }
 
     #[tokio::test]
