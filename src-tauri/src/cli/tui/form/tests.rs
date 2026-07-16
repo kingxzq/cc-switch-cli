@@ -771,8 +771,9 @@ fn provider_add_form_runapi_template_codex_sets_v1_base_url() {
     assert_eq!(provider["name"], "RunAPI");
     assert_eq!(provider["category"], "aggregator");
     assert_eq!(provider["icon"], "runapi");
-    assert!(cfg.contains("model_provider = \"runapi\""));
-    assert!(cfg.contains("[model_providers.runapi]"));
+    assert!(cfg.contains("model_provider = \"custom\""));
+    assert!(cfg.contains("[model_providers.custom]"));
+    assert!(cfg.contains("name = \"RunAPI\""));
     assert!(cfg.contains("base_url = \"https://runapi.co/v1\""));
     assert!(cfg.contains("model = \"gpt-5.4\""));
     assert!(cfg.contains("wire_api = \"responses\""));
@@ -1878,8 +1879,10 @@ fn provider_add_form_packycode_template_codex_sets_partner_meta_and_base_url() {
     let cfg = provider["settingsConfig"]["config"]
         .as_str()
         .expect("settingsConfig.config should be string");
-    assert!(cfg.contains("model_provider ="));
-    assert!(cfg.contains("[model_providers."));
+    assert!(cfg.contains("model_provider = \"custom\""));
+    assert!(cfg.contains("[model_providers.custom]"));
+    assert!(cfg.contains("name = \"PackyCode\""));
+    assert!(!cfg.contains("[model_providers.packycode]"));
     assert!(cfg.contains("base_url = \"https://www.packyapi.com/v1\""));
     assert!(cfg.contains("wire_api = \"responses\""));
     assert!(cfg.contains("requires_openai_auth = true"));
@@ -2312,8 +2315,10 @@ fn provider_add_form_codex_builds_full_toml_config() {
     let cfg = provider["settingsConfig"]["config"]
         .as_str()
         .expect("settingsConfig.config should be string");
-    assert!(cfg.contains("model_provider ="));
-    assert!(cfg.contains("[model_providers."));
+    assert!(cfg.contains("model_provider = \"custom\""));
+    assert!(cfg.contains("[model_providers.custom]"));
+    assert!(cfg.contains("name = \"Codex Provider\""));
+    assert!(!cfg.contains("[model_providers.c1]"));
     assert!(cfg.contains("base_url = \"https://api.openai.com/v1\""));
     assert!(cfg.contains("model = \"gpt-5.4\""));
     assert!(cfg.contains("wire_api = \"responses\""));
@@ -2331,12 +2336,12 @@ fn provider_add_form_codex_preserves_existing_config_toml_custom_keys() {
                 "OPENAI_API_KEY": "sk-test"
             },
             "config": r#"
-model_provider = "custom"
+model_provider = "vendor_alpha"
 model = "gpt-5.2-codex"
 network_access = true
 
-[model_providers.custom]
-name = "custom"
+[model_providers.vendor_alpha]
+name = "Vendor Alpha"
 base_url = "https://api.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
@@ -2360,6 +2365,9 @@ requires_openai_auth = true
         cfg.contains("base_url = \"https://changed.example/v1\""),
         "Codex base_url form field should still update config.toml"
     );
+    assert!(cfg.contains("model_provider = \"vendor_alpha\""), "{cfg}");
+    assert!(cfg.contains("[model_providers.vendor_alpha]"), "{cfg}");
+    assert!(!cfg.contains("[model_providers.custom]"), "{cfg}");
 }
 
 #[test]

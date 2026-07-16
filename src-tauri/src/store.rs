@@ -96,8 +96,7 @@ impl AppState {
         Self::from_parts(db, config)
     }
 
-    /// 创建新的应用状态，并在真实进程启动路径上执行一次启动恢复。
-    pub fn try_new_with_startup_recovery() -> Result<Self, AppError> {
+    fn try_new_with_startup_recovery_without_codex_migration() -> Result<Self, AppError> {
         let state = Self::try_new()?;
 
         state.import_live_provider_configs_on_startup()?;
@@ -122,67 +121,33 @@ impl AppState {
         }
 
         state.import_live_current_provider_configs_on_startup()?;
+
+        Ok(state)
+    }
+
+    /// 创建新的应用状态，并像上游一样在后台执行 Codex 历史迁移。
+    pub fn try_new_with_startup_recovery_deferred() -> Result<Self, AppError> {
+        let state = Self::try_new_with_startup_recovery_without_codex_migration()?;
+        let db = Arc::clone(&state.db);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cc-switch-codex-bucket-migration".to_string())
+            .spawn(move || run_codex_provider_bucket_migrations(&db))
+        {
+            log::warn!("✗ Failed to start Codex provider bucket migration: {error}");
+        }
+        Ok(state)
+    }
+
+    /// 创建新的应用状态，并同步完成启动迁移，供短生命周期 CLI 与测试使用。
+    pub fn try_new_with_startup_recovery() -> Result<Self, AppError> {
+        let state = Self::try_new_with_startup_recovery_without_codex_migration()?;
         state.migrate_codex_provider_buckets_on_startup();
 
         Ok(state)
     }
 
     fn migrate_codex_provider_buckets_on_startup(&self) {
-        match crate::codex_history_migration::maybe_migrate_codex_third_party_history_provider_bucket(
-            &self.db,
-        ) {
-            Ok(outcome) => {
-                if let Some(reason) = outcome.skipped_reason {
-                    log::debug!("○ Codex history provider bucket migration skipped: {reason}");
-                } else {
-                    log::info!(
-                        "✓ Codex history provider bucket migration completed: sources={}, jsonl_files={}, state_rows={}",
-                        outcome.source_provider_ids.len(),
-                        outcome.migrated_jsonl_files,
-                        outcome.migrated_state_rows
-                    );
-                }
-            }
-            Err(error) => {
-                log::warn!("✗ Codex history provider bucket migration failed: {error}");
-            }
-        }
-
-        match crate::codex_history_migration::maybe_migrate_codex_provider_template_bucket(&self.db)
-        {
-            Ok(outcome) => {
-                if let Some(reason) = outcome.skipped_reason {
-                    log::debug!("○ Codex provider template bucket migration skipped: {reason}");
-                } else if !outcome.migrated_provider_ids.is_empty() {
-                    log::info!(
-                        "✓ Codex provider template bucket migration completed: providers={}",
-                        outcome.migrated_provider_ids.len()
-                    );
-                }
-            }
-            Err(error) => {
-                log::warn!("✗ Codex provider template bucket migration failed: {error}");
-            }
-        }
-
-        match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket(
-        ) {
-            Ok(outcome) => {
-                if let Some(reason) = outcome.skipped_reason {
-                    log::debug!("○ Codex official history unify migration skipped: {reason}");
-                } else {
-                    log::info!(
-                        "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
-                        outcome.migrated_jsonl_files,
-                        outcome.migrated_state_rows
-                    );
-                }
-            }
-            Err(error) => {
-                log::warn!("✗ Codex official history unify migration failed: {error}");
-            }
-        }
-
+        run_codex_provider_bucket_migrations(&self.db);
         if let Err(error) = self.refresh_config_from_db() {
             log::warn!("✗ Failed to refresh config after Codex provider bucket migration: {error}");
         }
@@ -400,6 +365,74 @@ impl AppState {
             proxy_service,
         })
     }
+}
+
+fn run_codex_provider_bucket_migrations(db: &Database) {
+    let _ = run_required_codex_provider_bucket_migrations(db);
+
+    match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
+        Ok(outcome) => {
+            if let Some(reason) = outcome.skipped_reason {
+                log::debug!("○ Codex official history unify migration skipped: {reason}");
+            } else {
+                log::info!(
+                    "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
+                    outcome.migrated_jsonl_files,
+                    outcome.migrated_state_rows
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("✗ Codex official history unify migration failed: {error}");
+        }
+    }
+}
+
+fn run_required_codex_provider_bucket_migrations(db: &Database) -> Result<(), AppError> {
+    match crate::codex_history_migration::maybe_migrate_codex_third_party_history_provider_bucket(
+        db,
+    ) {
+        Ok(outcome) => {
+            if let Some(reason) = outcome.skipped_reason {
+                log::debug!("○ Codex history provider bucket migration skipped: {reason}");
+            } else {
+                log::info!(
+                    "✓ Codex history provider bucket migration completed: sources={}, jsonl_files={}, state_rows={}",
+                    outcome.source_provider_ids.len(),
+                    outcome.migrated_jsonl_files,
+                    outcome.migrated_state_rows
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("✗ Codex history provider bucket migration failed: {error}");
+            // Dynamic ids can only be derived from the old templates. Keep
+            // those templates intact so a failed history pass remains retryable.
+            log::debug!(
+                "○ Codex provider template bucket migration deferred until history succeeds"
+            );
+            return Err(error);
+        }
+    }
+
+    match crate::codex_history_migration::maybe_migrate_codex_provider_template_bucket(db) {
+        Ok(outcome) => {
+            if let Some(reason) = outcome.skipped_reason {
+                log::debug!("○ Codex provider template bucket migration skipped: {reason}");
+            } else if !outcome.migrated_provider_ids.is_empty() {
+                log::info!(
+                    "✓ Codex provider template bucket migration completed: providers={}",
+                    outcome.migrated_provider_ids.len()
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("✗ Codex provider template bucket migration failed: {error}");
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 fn export_db_to_multi_app_config(db: &Database) -> Result<MultiAppConfig, AppError> {
@@ -775,6 +808,25 @@ wire_api = "responses"
     #[serial(home_settings)]
     fn startup_migrates_imported_codex_live_provider_after_import() {
         let temp_home = TempDir::new().expect("create temp home");
+        write_json(
+            temp_home.path().join(".cc-switch/settings.json"),
+            json!({
+                "localMigrations": {
+                    "codexThirdPartyHistoryProviderBucketV1": {
+                        "completedAt": "2026-07-15T00:00:00Z",
+                        "targetProviderId": "custom",
+                        "sourceProviderIds": ["rightcode"],
+                        "migratedJsonlFiles": 0,
+                        "migratedStateRows": 0,
+                        "scannedHistoryFiles": true
+                    },
+                    "codexProviderTemplateV1": {
+                        "completedAt": "2026-07-15T00:00:00Z",
+                        "migratedProviderIds": ["rightcode"]
+                    }
+                }
+            }),
+        );
         let _env = TestEnvGuard::isolated(temp_home.path());
 
         write_json(
@@ -820,7 +872,7 @@ requires_openai_auth = true
 
         let migration = crate::settings::get_settings()
             .local_migrations
-            .and_then(|migrations| migrations.codex_third_party_history_provider_bucket_v1)
+            .and_then(|migrations| migrations.codex_third_party_history_provider_bucket_v2)
             .expect("history migration should be marked after imported provider is visible");
         assert_eq!(migration.target_provider_id, "custom");
         assert!(
@@ -830,6 +882,17 @@ requires_openai_auth = true
                 .any(|provider_id| provider_id == "rightcode"),
             "startup migration should collect source ids from the imported live provider"
         );
+        assert!(crate::settings::get_settings()
+            .local_migrations
+            .and_then(|migrations| migrations.codex_provider_template_v2)
+            .is_some());
+        let migrations = crate::settings::get_settings()
+            .local_migrations
+            .expect("migration markers");
+        assert!(migrations
+            .codex_third_party_history_provider_bucket_v1
+            .is_some());
+        assert!(migrations.codex_provider_template_v1.is_some());
     }
 
     #[test]

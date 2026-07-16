@@ -563,7 +563,7 @@ pub fn build_provider_template_seed(
     let website_url = template_default_website_url(template).map(str::to_string);
     let category = template_default_category(template).map(str::to_string);
     let meta = template_default_meta(app_type, template);
-    let settings_config = build_provider_template_settings_config(app_type, template, &id)?;
+    let settings_config = build_provider_template_settings_config(app_type, template)?;
     let icon = template_default_icon(template).map(str::to_string);
     let icon_color = template_default_icon_color(template).map(str::to_string);
 
@@ -741,7 +741,6 @@ fn template_default_icon_color(template: ProviderAddTemplate) -> Option<&'static
 fn build_provider_template_settings_config(
     app_type: &AppType,
     template: ProviderAddTemplate,
-    provider_id: &str,
 ) -> Result<Value, AppError> {
     match template {
         ProviderAddTemplate::ClaudeOfficial => Ok(json!({ "env": {} })),
@@ -772,7 +771,6 @@ fn build_provider_template_settings_config(
         | ProviderAddTemplate::Fenno => build_sponsor_template_settings_config(
             app_type,
             sponsor_preset(template).ok_or_else(|| unsupported_template_error(template))?,
-            provider_id,
         ),
         ProviderAddTemplate::Custom => Err(unsupported_template_error(template)),
     }
@@ -941,7 +939,6 @@ fn fenno_openclaw_models() -> Value {
 fn build_sponsor_template_settings_config(
     app_type: &AppType,
     preset: SponsorProviderPreset,
-    provider_id: &str,
 ) -> Result<Value, AppError> {
     match app_type {
         AppType::Claude => Ok(json!({
@@ -961,7 +958,7 @@ fn build_sponsor_template_settings_config(
                 "gpt-5.4"
             },
             "responses",
-            provider_id,
+            preset.provider_name,
         )),
         AppType::Gemini => {
             if preset.id == ProviderAddTemplate::Qiniu {
@@ -1207,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_codex_prompt_update_preserves_template_model_provider_key() {
+    fn cli_codex_prompt_update_uses_stable_template_model_provider_key() {
         let seed =
             build_provider_template_seed(&AppType::Codex, ProviderAddTemplate::Aicodemirror, &[])
                 .expect("build AICodeMirror Codex seed");
@@ -1224,13 +1221,47 @@ mod tests {
             .get("config")
             .and_then(Value::as_str)
             .expect("config should be present");
-        assert!(config.contains("model_provider = \"aicodemirror\""));
-        assert!(config.contains("[model_providers.aicodemirror]"));
-        assert!(!config.contains("model_provider = \"custom\""));
-        assert!(!config.contains("[model_providers.custom]"));
+        assert!(config.contains("model_provider = \"custom\""));
+        assert!(config.contains("[model_providers.custom]"));
+        assert!(config.contains("name = \"AICodeMirror\""));
+        assert!(!config.contains("[model_providers.aicodemirror]"));
         assert!(config.contains("model = \"gpt-6\""));
         assert!(config.contains("base_url = \"https://codex.example/v1\""));
         assert_eq!(cfg["auth"]["OPENAI_API_KEY"], "sk-updated");
+    }
+
+    #[test]
+    fn cli_codex_prompt_update_preserves_user_authored_model_provider_key() {
+        let current = json!({
+            "auth": { "OPENAI_API_KEY": "sk-old" },
+            "config": r#"model_provider = "my-private-relay"
+model = "gpt-5.4"
+
+[model_providers.my-private-relay]
+name = "Manual Relay"
+base_url = "https://old.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+        });
+
+        let cfg = build_codex_settings_config_from_prompt(
+            Some(&current),
+            "sk-updated",
+            "https://new.example/v1",
+            "gpt-6",
+            "custom",
+        );
+        let config = cfg
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("config should be present");
+
+        assert!(config.contains("model_provider = \"my-private-relay\""));
+        assert!(config.contains("[model_providers.my-private-relay]"));
+        assert!(!config.contains("[model_providers.custom]"));
+        assert!(config.contains("base_url = \"https://new.example/v1\""));
+        assert!(config.contains("model = \"gpt-6\""));
     }
 
     #[test]
@@ -2473,17 +2504,12 @@ requires_openai_auth = true
     }
 }
 
-/// Generate a clean TOML key from a provider name/id for use in model_provider and [model_providers.<key>].
-fn clean_codex_provider_key(raw: &str) -> String {
-    crate::codex_config::clean_codex_provider_key(raw)
-}
-
 fn build_codex_settings_config(
     api_key: Option<&str>,
     base_url: &str,
     model: &str,
     wire_api: &str,
-    provider_key: &str,
+    provider_name: &str,
 ) -> Value {
     let model = if model.trim().is_empty() {
         "gpt-5.4"
@@ -2491,10 +2517,9 @@ fn build_codex_settings_config(
         model.trim()
     };
     let base_url = base_url.trim();
-    let provider_key = clean_codex_provider_key(provider_key);
 
-    let config_toml = crate::codex_config::build_codex_provider_config_toml(
-        &provider_key,
+    let config_toml = crate::codex_config::build_codex_third_party_config_toml(
+        provider_name,
         base_url,
         model,
         wire_api,
@@ -2564,7 +2589,7 @@ pub(crate) fn build_codex_settings_config_from_prompt(
     api_key: &str,
     base_url: &str,
     model: &str,
-    fallback_provider_key: &str,
+    provider_name: &str,
 ) -> Value {
     let model = if model.trim().is_empty() {
         "gpt-5.4"
@@ -2577,9 +2602,8 @@ pub(crate) fn build_codex_settings_config_from_prompt(
         .and_then(Value::as_str)
         .unwrap_or("");
     let base_config = if current_config.trim().is_empty() {
-        let provider_key = clean_codex_provider_key(fallback_provider_key);
-        crate::codex_config::build_codex_provider_config_toml(
-            &provider_key,
+        crate::codex_config::build_codex_third_party_config_toml(
+            provider_name,
             base_url,
             model,
             "responses",
@@ -3734,6 +3758,7 @@ pub fn prompt_settings_config(
     current: Option<&Value>,
     current_meta: Option<&ProviderMeta>,
     codex_official: bool,
+    provider_name: &str,
 ) -> Result<SettingsConfigPromptResult, AppError> {
     match app_type {
         AppType::Claude => prompt_claude_config(current, current_meta),
@@ -3781,7 +3806,7 @@ pub fn prompt_settings_config(
             if !has_auth && is_openai_official_endpoint {
                 prompt_codex_official_config(current).map(SettingsConfigPromptResult::new)
             } else {
-                prompt_codex_config(current).map(SettingsConfigPromptResult::new)
+                prompt_codex_config(current, provider_name).map(SettingsConfigPromptResult::new)
             }
         }
         AppType::Gemini => prompt_gemini_config(current).map(SettingsConfigPromptResult::new),
@@ -4079,7 +4104,7 @@ pub(crate) fn build_claude_settings_config_from_prompt<'a>(
 }
 
 /// Codex 配置输入（第三方/自定义：需要 API Key）
-fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
+fn prompt_codex_config(current: Option<&Value>, provider_name: &str) -> Result<Value, AppError> {
     println!("\n{}", texts::config_codex_header().bright_cyan().bold());
 
     // 从当前配置提取值
@@ -4178,7 +4203,7 @@ fn prompt_codex_config(current: Option<&Value>) -> Result<Value, AppError> {
         &api_key,
         &base_url,
         model.trim(),
-        "custom",
+        provider_name,
     ))
 }
 

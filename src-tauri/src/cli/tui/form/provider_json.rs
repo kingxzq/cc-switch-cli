@@ -4,9 +4,7 @@ use crate::services::ProviderService;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use super::codex_config::{
-    build_codex_provider_config_toml, clean_codex_provider_key, update_codex_config_snippet,
-};
+use super::codex_config::{build_codex_third_party_config_toml, update_codex_config_snippet};
 use super::{
     normalize_local_proxy_header_overrides, parse_codex_model_catalog_context_window,
     ClaudeApiFormat, GeminiAuthType, ProviderAddFormState, UsageQueryTemplate,
@@ -81,10 +79,14 @@ impl ProviderAddFormState {
 
     fn effective_custom_codex_config_text(&self, model: &str) -> String {
         let existing_config = self.existing_codex_config_text();
-        let provider_key = clean_codex_provider_key(self.id.value.trim(), self.name.value.trim());
         let base_url = self.codex_base_url.value.trim().trim_end_matches('/');
         let base_config = if existing_config.trim().is_empty() {
-            build_codex_provider_config_toml(&provider_key, base_url, model, self.codex_wire_api)
+            build_codex_third_party_config_toml(
+                self.name.value.trim(),
+                base_url,
+                model,
+                self.codex_wire_api,
+            )
         } else {
             existing_config.to_string()
         };
@@ -100,11 +102,10 @@ impl ProviderAddFormState {
             config = crate::codex_config::set_codex_goal_mode(&config, self.codex_goal_mode);
         }
         if self.codex_remote_compaction_touched {
-            // Empty fallback restores the config's own active provider id.
             config = crate::codex_config::set_codex_remote_compaction(
                 &config,
                 self.codex_remote_compaction,
-                "",
+                self.name.value.trim(),
             );
         }
         config

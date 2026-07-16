@@ -346,6 +346,12 @@ pub struct LocalMigrations {
         Option<CodexThirdPartyHistoryProviderBucketMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_provider_template_v1: Option<CodexProviderTemplateMigration>,
+    /// v2 also repairs dynamic provider ids emitted by older CLI builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_third_party_history_provider_bucket_v2:
+        Option<CodexThirdPartyHistoryProviderBucketMigration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_provider_template_v2: Option<CodexProviderTemplateMigration>,
     /// 统一会话开关的官方历史迁移标记。开关关闭时会被清除，
     /// 这样重新开启能把关闭期间落入 openai 桶的官方会话补迁进来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -713,6 +719,17 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
                 existing_migrations.codex_provider_template_v1;
         }
         if incoming_migrations
+            .codex_third_party_history_provider_bucket_v2
+            .is_none()
+        {
+            incoming_migrations.codex_third_party_history_provider_bucket_v2 =
+                existing_migrations.codex_third_party_history_provider_bucket_v2;
+        }
+        if incoming_migrations.codex_provider_template_v2.is_none() {
+            incoming_migrations.codex_provider_template_v2 =
+                existing_migrations.codex_provider_template_v2;
+        }
+        if incoming_migrations
             .codex_official_history_unify_v1
             .is_none()
         {
@@ -752,7 +769,7 @@ pub fn is_codex_third_party_history_provider_bucket_migrated() -> bool {
         .as_ref()
         .and_then(|migrations| {
             migrations
-                .codex_third_party_history_provider_bucket_v1
+                .codex_third_party_history_provider_bucket_v2
                 .as_ref()
         })
         .is_some_and(|migration| migration.scanned_history_files)
@@ -765,7 +782,7 @@ pub fn mark_codex_third_party_history_provider_bucket_migrated(
         let migrations = settings
             .local_migrations
             .get_or_insert_with(Default::default);
-        migrations.codex_third_party_history_provider_bucket_v1 = Some(migration);
+        migrations.codex_third_party_history_provider_bucket_v2 = Some(migration);
     })
 }
 
@@ -773,7 +790,7 @@ pub fn is_codex_provider_template_migrated() -> bool {
     get_settings()
         .local_migrations
         .as_ref()
-        .and_then(|migrations| migrations.codex_provider_template_v1.as_ref())
+        .and_then(|migrations| migrations.codex_provider_template_v2.as_ref())
         .is_some()
 }
 
@@ -784,7 +801,7 @@ pub fn mark_codex_provider_template_migrated(
         let migrations = settings
             .local_migrations
             .get_or_insert_with(Default::default);
-        migrations.codex_provider_template_v1 = Some(migration);
+        migrations.codex_provider_template_v2 = Some(migration);
     })
 }
 
@@ -1151,12 +1168,41 @@ pub fn set_skip_claude_onboarding(enabled: bool) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppSettings;
+    use super::{AppSettings, LocalMigrations};
+    use serde_json::json;
 
     #[test]
     fn codex_unified_session_history_defaults_off() {
         let settings = AppSettings::default();
         assert!(!settings.unify_codex_session_history);
         assert_eq!(settings.unify_codex_migrate_existing, None);
+    }
+
+    #[test]
+    fn codex_dynamic_provider_v2_does_not_reuse_v1_markers() {
+        let migrations: LocalMigrations = serde_json::from_value(json!({
+            "codexThirdPartyHistoryProviderBucketV1": {
+                "completedAt": "2026-07-15T00:00:00Z",
+                "targetProviderId": "custom",
+                "sourceProviderIds": ["aicodemirror"],
+                "migratedJsonlFiles": 1,
+                "migratedStateRows": 1,
+                "scannedHistoryFiles": true
+            },
+            "codexProviderTemplateV1": {
+                "completedAt": "2026-07-15T00:00:00Z",
+                "migratedProviderIds": ["aicodemirror"]
+            }
+        }))
+        .expect("deserialize v1 migration markers");
+
+        assert!(migrations
+            .codex_third_party_history_provider_bucket_v1
+            .is_some());
+        assert!(migrations.codex_provider_template_v1.is_some());
+        assert!(migrations
+            .codex_third_party_history_provider_bucket_v2
+            .is_none());
+        assert!(migrations.codex_provider_template_v2.is_none());
     }
 }

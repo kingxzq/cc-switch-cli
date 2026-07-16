@@ -1369,27 +1369,33 @@ pub fn clean_codex_provider_key(raw: &str) -> String {
     }
 }
 
-pub fn build_codex_provider_config_toml(
-    provider_key: &str,
+/// Build a CC Switch-managed third-party Codex config.
+///
+/// Codex persists `model_provider` in session metadata and uses it again when
+/// resuming a thread. All managed third-party providers therefore share the
+/// stable `custom` routing key, while `provider_name` remains a display name.
+pub fn build_codex_third_party_config_toml(
+    provider_name: &str,
     base_url: &str,
     model: &str,
     wire_api: &str,
 ) -> String {
-    let provider_key = escape_toml_string(provider_key);
-    let model = escape_toml_string(model);
-    let base_url = escape_toml_string(base_url);
-    let wire_api = escape_toml_string(wire_api);
+    let provider_name = non_empty(provider_name).unwrap_or(CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
+    let provider_name = toml_edit::Value::from(provider_name).to_string();
+    let model = toml_edit::Value::from(model).to_string();
+    let base_url = toml_edit::Value::from(base_url).to_string();
+    let wire_api = toml_edit::Value::from(wire_api).to_string();
 
     [
-        format!("model_provider = \"{}\"", provider_key),
-        format!("model = \"{}\"", model),
+        format!("model_provider = \"{}\"", CC_SWITCH_CODEX_MODEL_PROVIDER_ID),
+        format!("model = {model}"),
         "model_reasoning_effort = \"high\"".to_string(),
         "disable_response_storage = true".to_string(),
         String::new(),
-        format!("[model_providers.{}]", provider_key),
-        format!("name = \"{}\"", provider_key),
-        format!("base_url = \"{}\"", base_url),
-        format!("wire_api = \"{}\"", wire_api),
+        format!("[model_providers.{}]", CC_SWITCH_CODEX_MODEL_PROVIDER_ID),
+        format!("name = {provider_name}"),
+        format!("base_url = {base_url}"),
+        format!("wire_api = {wire_api}"),
         "requires_openai_auth = true".to_string(),
         String::new(),
     ]
@@ -1637,16 +1643,45 @@ fn non_empty(value: &str) -> Option<&str> {
     }
 }
 
-fn escape_toml_string(value: &str) -> String {
-    value.replace('"', "\\\"")
-}
-
 #[cfg(test)]
 mod quick_config_toggle_tests {
     use super::*;
 
     fn base_config() -> String {
-        build_codex_provider_config_toml("myco", "https://api.example.com/v1", "gpt-x", "responses")
+        build_codex_third_party_config_toml(
+            "My Company",
+            "https://api.example.com/v1",
+            "gpt-x",
+            "responses",
+        )
+    }
+
+    #[test]
+    fn third_party_config_uses_stable_custom_provider_bucket() {
+        let cfg = build_codex_third_party_config_toml(
+            "Vendor \"Alpha\"",
+            "https://api.example.com/v1",
+            "gpt-x",
+            "responses",
+        );
+        let parsed: toml::Value = toml::from_str(&cfg).expect("parse generated config");
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some("custom")
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|providers| providers.get("custom"))
+                .and_then(|provider| provider.get("name"))
+                .and_then(toml::Value::as_str),
+            Some("Vendor \"Alpha\"")
+        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|providers| providers.get("vendor_alpha"))
+            .is_none());
     }
 
     #[test]
@@ -1679,15 +1714,15 @@ mod quick_config_toggle_tests {
     #[test]
     fn remote_compaction_sets_and_restores_name() {
         let cfg = base_config();
-        assert!(cfg.contains("name = \"myco\""));
+        assert!(cfg.contains("name = \"My Company\""));
         assert!(!is_codex_remote_compaction_enabled(&cfg));
 
-        let on = set_codex_remote_compaction(&cfg, true, "myco");
+        let on = set_codex_remote_compaction(&cfg, true, "My Company");
         assert!(on.contains("name = \"OpenAI\""));
         assert!(is_codex_remote_compaction_enabled(&on));
 
-        let off = set_codex_remote_compaction(&on, false, "myco");
-        assert!(off.contains("name = \"myco\""));
+        let off = set_codex_remote_compaction(&on, false, "My Company");
+        assert!(off.contains("name = \"My Company\""));
         assert!(!off.contains("name = \"OpenAI\""));
         assert!(!is_codex_remote_compaction_enabled(&off));
     }
