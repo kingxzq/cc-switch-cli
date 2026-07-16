@@ -341,22 +341,35 @@ pub(crate) fn scan_sessions_progressive_for_provider_cancellable(
 /// Bounded, owned-row provider stream for page-manifest construction. Unlike
 /// the compatibility scan APIs above, this path never returns a provider-sized
 /// `Vec`, never collects every target before parsing, and never loads every
-/// sidecar row into a `HashMap`.
+/// sidecar row into a `HashMap`. The optional identity enricher is registered
+/// only after base rows have reached the provisional sink; it applies bounded
+/// provider metadata while the manifest consumes its identity-ordered run.
 pub(crate) fn stream_sessions_for_provider_cancellable(
     store: Option<&ScanCacheStore>,
     provider_id: &str,
     force: bool,
     on_session: &mut dyn FnMut(SessionMeta) -> ControlFlow<()>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<cache::StreamScanStats, cache::StreamScanStop> {
+) -> Result<
+    (
+        cache::StreamScanStats,
+        Option<Box<dyn paged_manifest::IdentityRowEnricher>>,
+    ),
+    cache::StreamScanStop,
+> {
     match provider_id {
         "codex" => codex::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        "claude" => claude::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        "opencode" => opencode::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        "openclaw" => openclaw::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        "gemini" => gemini::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        "hermes" => hermes::stream_sessions_cancellable(store, force, on_session, is_cancelled),
-        _ => Ok(cache::StreamScanStats::default()),
+        "claude" => claude::stream_sessions_cancellable(store, force, on_session, is_cancelled)
+            .map(|stats| (stats, None)),
+        "opencode" => opencode::stream_sessions_cancellable(store, force, on_session, is_cancelled)
+            .map(|stats| (stats, None)),
+        "openclaw" => openclaw::stream_sessions_cancellable(store, force, on_session, is_cancelled)
+            .map(|stats| (stats, None)),
+        "gemini" => gemini::stream_sessions_cancellable(store, force, on_session, is_cancelled)
+            .map(|stats| (stats, None)),
+        "hermes" => hermes::stream_sessions_cancellable(store, force, on_session, is_cancelled)
+            .map(|stats| (stats, None)),
+        _ => Ok((cache::StreamScanStats::default(), None)),
     }
 }
 
@@ -414,10 +427,16 @@ pub(crate) fn build_fresh_session_manifest(
         if let Some(error) = sink_error {
             return Err(format!("session page sink failed: {error}"));
         }
-        if let Err(reason) = outcome {
-            return Err(format!(
-                "session source scan for {provider_id} stopped before completion: {reason:?}"
-            ));
+        match outcome {
+            Ok((_stats, Some(enricher))) => builder
+                .add_identity_enricher(enricher)
+                .map_err(|error| format!("session title enrichment setup failed: {error}"))?,
+            Ok((_stats, None)) => {}
+            Err(reason) => {
+                return Err(format!(
+                    "session source scan for {provider_id} stopped before completion: {reason:?}"
+                ));
+            }
         }
     }
 

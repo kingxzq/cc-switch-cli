@@ -1720,8 +1720,12 @@ fn run_session_scan(
             if let Some(error) = push_error {
                 return Err(error);
             }
-            if scan.is_err() {
-                return Err("session manifest scan was stopped".to_string());
+            match scan {
+                Ok((_stats, Some(enricher))) => builder
+                    .add_identity_enricher(enricher)
+                    .map_err(|error| error.to_string())?,
+                Ok((_stats, None)) => {}
+                Err(_) => return Err("session manifest scan was stopped".to_string()),
             }
         }
         if needs_provisional && seen > last_preview {

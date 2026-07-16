@@ -495,6 +495,7 @@ impl PagedManifestStore {
             next_run_id: 0,
             published: false,
             expected_source: None,
+            identity_row_enrichers: Vec::new(),
             #[cfg(test)]
             peak_retained_run_paths: 0,
             #[cfg(test)]
@@ -1511,6 +1512,26 @@ impl ManifestReader {
     }
 }
 
+/// Infallible transformation applied to rows after the identity merge has
+/// ordered them, but before duplicate identities and recency are resolved.
+///
+/// Implementations must not change `provider_id`, `session_id`, or
+/// `source_path`: those fields define both the run order and deduplication
+/// identity. Enrichers run in registration order and should degrade locally
+/// when their optional backing source is unavailable.
+pub(crate) trait IdentityRowEnricher: Send {
+    fn enrich(&mut self, row: &mut SessionMeta);
+}
+
+impl<F> IdentityRowEnricher for F
+where
+    F: FnMut(&mut SessionMeta) + Send,
+{
+    fn enrich(&mut self, row: &mut SessionMeta) {
+        self(row);
+    }
+}
+
 /// Streaming manifest builder. The only N-sized state lives in temporary files;
 /// the in-memory buffer never exceeds its configured spill bound.
 pub(crate) struct PagedManifestBuilder {
@@ -1532,6 +1553,7 @@ pub(crate) struct PagedManifestBuilder {
     /// A repack must publish only if it still derives from the exact current
     /// immutable generation captured after its build epoch was won.
     expected_source: Option<(String, u64)>,
+    identity_row_enrichers: Vec<Box<dyn IdentityRowEnricher>>,
     #[cfg(test)]
     peak_retained_run_paths: usize,
     /// Deterministic fault injection for the pointer-publication regression
@@ -1562,6 +1584,18 @@ impl PagedManifestBuilder {
 
     pub(crate) fn scope(&self) -> &str {
         &self.scope
+    }
+
+    /// Register an infallible row enricher for the identity-ordered publish
+    /// pass. Registration may happen after rows have been pushed because every
+    /// row is enriched only when the completed identity run is consumed.
+    pub(crate) fn add_identity_enricher(
+        &mut self,
+        enricher: Box<dyn IdentityRowEnricher>,
+    ) -> Result<(), ManifestError> {
+        self.ensure_active()?;
+        self.identity_row_enrichers.push(enricher);
+        Ok(())
     }
 
     pub(crate) fn push(&mut self, row: SessionMeta) -> Result<(), ManifestError> {
@@ -1857,11 +1891,22 @@ impl PagedManifestBuilder {
         let mut reader = RunReader::open(&run_path)?;
         let mut pending: Option<SessionMeta> = None;
         let mut visited = 0usize;
-        while let Some(row) = reader.next_row()? {
+        while let Some(mut row) = reader.next_row()? {
             if visited.is_multiple_of(1_024) {
                 self.ensure_persistent_active()?;
             }
             visited = visited.saturating_add(1);
+            if !self.identity_row_enrichers.is_empty() {
+                for enricher in &mut self.identity_row_enrichers {
+                    enricher.enrich(&mut row);
+                }
+                let Some(sanitized) = sanitize_manifest_row(row)
+                    .map_err(|error| ManifestError::json(&self.staging_dir, error))?
+                else {
+                    continue;
+                };
+                row = sanitized;
+            }
             if pending
                 .as_ref()
                 .is_some_and(|previous| same_identity(previous, &row))
@@ -3087,6 +3132,59 @@ mod tests {
         }
         assert_eq!(duplicates.len(), 1);
         assert_eq!(duplicates[0].last_active_at, Some(10_000));
+    }
+
+    #[test]
+    fn identity_row_enrichment_reaches_pages_without_breaking_deduplication() {
+        let (_temp, store) = test_store();
+        let visits = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = store
+            .begin_build_with_options(
+                "codex",
+                BuildOptions {
+                    spill_rows: 1,
+                    merge_fan_in: 2,
+                },
+            )
+            .expect("begin");
+        builder
+            .add_identity_enricher(Box::new({
+                let visits = Arc::clone(&visits);
+                move |row: &mut SessionMeta| {
+                    let recency = row.last_active_at.unwrap_or_default();
+                    visits
+                        .lock()
+                        .expect("record enrichment visit")
+                        .push(recency);
+                    row.title = Some(format!("enriched {recency}"));
+                }
+            }))
+            .expect("add identity enricher");
+
+        builder
+            .push(meta("codex", "duplicate", 1))
+            .expect("push older duplicate");
+        builder
+            .push(meta("codex", "duplicate", 10))
+            .expect("push newer duplicate");
+        let published = builder.publish().expect("publish");
+
+        assert_eq!(published.total_rows, 1);
+        assert_eq!(published.first_page.rows.len(), 1);
+        assert_eq!(
+            published.first_page.rows[0].title.as_deref(),
+            Some("enriched 10")
+        );
+        assert_eq!(
+            published.first_page.rows[0].last_active_at,
+            Some(10),
+            "the newest duplicate must remain authoritative"
+        );
+        assert_eq!(
+            *visits.lock().expect("read enrichment visits"),
+            vec![10, 1],
+            "identity-run rows must be enriched in their sorted order before dedupe"
+        );
     }
 
     #[test]
