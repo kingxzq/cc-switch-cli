@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta, UsageScript};
+use crate::services::mcp::McpService;
 use crate::store::AppState;
 
 use gemini_auth::GeminiAuthType;
@@ -77,6 +78,15 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
         common_config_snippet.as_deref(),
         true,
     )?;
+    // 重写 live 会整体替换 config.toml（有意设计），[mcp_servers] 随之丢失，
+    // 写完必须立刻从 DB 重新投影启用的 MCP。只投影 Codex 而非
+    // sync_all_enabled：后者按应用顺序逐应用短路，排在 Codex 前面的无关
+    // 应用 live 损坏会阻断 Codex 的重投影，让刚被清掉的 [mcp_servers]
+    // 无人补回。投影失败降级为警告：此时 live 已按新开关状态落盘，
+    // 若把错误上抛并回滚设置，会制造“设置=旧值、live=新桶”的会话分裂。
+    if let Err(err) = McpService::sync_enabled_for_app(state, &AppType::Codex) {
+        log::warn!("统一会话开关重写 live 后重投影 Codex MCP 失败（将在下次同步时自愈）: {err}");
+    }
     Ok(true)
 }
 

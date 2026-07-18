@@ -1198,6 +1198,39 @@ pub fn strip_codex_unified_session_bucket_from_settings(
     Ok(())
 }
 
+/// Backfill helper: strip `[mcp_servers]` from a live `{ auth, config }`
+/// settings object before it is stored back to the DB.
+pub fn strip_codex_mcp_servers_from_settings(settings: &mut Value) -> Result<(), AppError> {
+    let Some(config_text) = settings
+        .get("config")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    if !config_text.contains("mcp") {
+        return Ok(());
+    }
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let mut changed = doc.as_table_mut().remove("mcp_servers").is_some();
+    if let Some(mcp_tbl) = doc.get_mut("mcp").and_then(|item| item.as_table_like_mut()) {
+        if mcp_tbl.remove("servers").is_some() {
+            changed = true;
+        }
+        if mcp_tbl.is_empty() {
+            doc.as_table_mut().remove("mcp");
+        }
+    }
+    if changed {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.insert("config".to_string(), Value::String(doc.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Route a Codex live write between full auth+config or config-only.
 ///
 /// Official providers with usable login material own `auth.json`. Third-party

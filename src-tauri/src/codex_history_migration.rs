@@ -71,6 +71,7 @@ const CC_SWITCH_LEGACY_CODEX_MODEL_PROVIDER_IDS: &[&str] = &[
     "dmxapi",
     "doubaoseed",
     "eflowcode",
+    "etok",
     "kimi",
     "lemondata",
     "longcat",
@@ -3325,6 +3326,11 @@ model_provider = "my-private-relay"
         let ids = collect_source_model_provider_ids(&db).expect("collect ids");
         assert!(ids.contains("aihubmix"));
         assert!(!ids.contains("generated-uuid"));
+    }
+
+    #[test]
+    fn recognizes_upstream_etok_legacy_provider_id() {
+        assert!(is_known_cc_switch_legacy_codex_model_provider_id("etok"));
     }
 
     #[test]

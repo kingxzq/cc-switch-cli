@@ -107,6 +107,7 @@ impl AppState {
             .proxy_service
             .should_skip_startup_recovery_for_active_managed_session_blocking()
             .map_err(AppError::Message)?;
+        let mut live_config_is_safe_to_repair = false;
         if !owned_managed_session_active {
             let proxy_running = state
                 .proxy_service
@@ -117,12 +118,75 @@ impl AppState {
                     .proxy_service
                     .recover_takeovers_on_startup_blocking()
                     .map_err(AppError::Config)?;
+                live_config_is_safe_to_repair = true;
             }
         }
 
         state.import_live_current_provider_configs_on_startup()?;
+        if live_config_is_safe_to_repair {
+            match state.repair_disabled_codex_unified_session_live() {
+                Ok(true) => log::info!(
+                    "✓ Removed a stale unified-session route from the active Codex config"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("✗ Failed to repair the active Codex unified-session route: {error}")
+                }
+            }
+        }
 
         Ok(state)
+    }
+
+    /// Repair the exact live-only route injected by older CLI builds after the
+    /// unified-history setting has been disabled. This deliberately leaves the
+    /// provider database snapshot untouched and never rewrites a proxy takeover.
+    fn repair_disabled_codex_unified_session_live(&self) -> Result<bool, AppError> {
+        use crate::app_config::AppType;
+        use crate::services::provider::ProviderService;
+
+        if crate::settings::unify_codex_session_history() {
+            return Ok(false);
+        }
+
+        let current_id = ProviderService::current(self, AppType::Codex)?;
+        if current_id.is_empty() {
+            return Ok(false);
+        }
+        let Some(provider) = self
+            .db
+            .get_provider_by_id(&current_id, AppType::Codex.as_str())?
+        else {
+            return Ok(false);
+        };
+        if provider.category.as_deref() != Some("official") {
+            return Ok(false);
+        }
+
+        let has_live_backup =
+            futures::executor::block_on(self.db.get_live_backup(AppType::Codex.as_str()))?
+                .is_some();
+        if has_live_backup
+            || self
+                .proxy_service
+                .detect_takeover_in_live_config_for_app(&AppType::Codex)
+        {
+            return Ok(false);
+        }
+
+        let path = crate::codex_config::get_codex_config_path();
+        let config_text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(AppError::io(&path, error)),
+        };
+        let stripped = crate::codex_config::strip_codex_unified_session_bucket(&config_text)?;
+        if stripped == config_text {
+            return Ok(false);
+        }
+
+        crate::config::write_text_file(&path, &stripped)?;
+        Ok(true)
     }
 
     /// 创建新的应用状态，并像上游一样在后台执行 Codex 历史迁移。
@@ -673,6 +737,7 @@ fn migrate_legacy_codex_configs(db: &Database, config: &mut MultiAppConfig) {
 #[cfg(test)]
 mod tests {
     use super::AppState;
+    use crate::provider::Provider;
     use crate::test_support::TestEnvGuard;
     use serde_json::json;
     use serial_test::serial;
@@ -802,6 +867,59 @@ wire_api = "responses"
         assert_eq!(manager.current, "default");
         assert!(manager.providers.contains_key("default"));
         assert!(manager.providers.contains_key("codex-official"));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn startup_repairs_stale_unified_route_for_current_official_codex_provider() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestEnvGuard::isolated(temp_home.path());
+
+        {
+            let state = AppState::try_new_with_startup_recovery().expect("seed startup state");
+            let mut third_party = Provider::with_id(
+                "third-party".to_string(),
+                "Third Party".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "third-party-key" },
+                    "config": "model_provider = \"third-party\"\n"
+                }),
+                None,
+            );
+            third_party.category = Some("custom".to_string());
+            state
+                .db
+                .save_provider("codex", &third_party)
+                .expect("seed a non-official provider");
+            state
+                .db
+                .set_current_provider("codex", "codex-official")
+                .expect("select official provider");
+            crate::settings::set_current_provider(
+                &crate::app_config::AppType::Codex,
+                Some("codex-official"),
+            )
+            .expect("persist official selection");
+        }
+
+        let original = "model = \"gpt-5.4\"\n\n[tui]\ntheme = \"dark\"\n\n[mcp_servers.echo]\ncommand = \"npx\"\n";
+        let stale = crate::codex_config::inject_codex_unified_session_bucket(original)
+            .expect("build stale v5.9.1 live config");
+        write_text(crate::codex_config::get_codex_config_path(), &stale);
+
+        let state = AppState::try_new_with_startup_recovery().expect("restart after upgrade");
+        let repaired = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read repaired live config");
+
+        assert!(!repaired.contains("model_provider = \"custom\""));
+        assert!(!repaired.contains("[model_providers.custom]"));
+        assert!(repaired.contains("[tui]"));
+        assert!(repaired.contains("[mcp_servers.echo]"));
+        assert_eq!(
+            crate::services::ProviderService::current(&state, crate::app_config::AppType::Codex,)
+                .expect("read current provider"),
+            "codex-official"
+        );
     }
 
     #[test]

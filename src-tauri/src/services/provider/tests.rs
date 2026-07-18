@@ -46,6 +46,42 @@ approval_policy = "never"
 }
 
 #[test]
+fn extract_codex_common_config_strips_provider_fields_and_injected_artifacts() {
+    let extracted = ProviderService::extract_codex_common_config_from_config_toml(
+        r#"model_provider = "azure"
+model = "gpt-4"
+wire_api = "chat"
+disable_response_storage = true
+experimental_bearer_token = "sk-live-secret"
+model_catalog_json = "cc-switch-model-catalog.json"
+
+[model_providers.azure]
+name = "Azure OpenAI"
+base_url = "https://example.openai.azure.com"
+wire_api = "responses"
+
+[mcp_servers.my_server]
+base_url = "http://localhost:8080"
+
+[mcp.servers.legacy_server]
+command = "legacy-cmd"
+"#,
+    )
+    .expect("extract common config");
+
+    assert!(!extracted.contains("model_provider"));
+    assert!(!extracted.contains("model = \"gpt-4\""));
+    assert!(!extracted.contains("base_url"));
+    assert!(!extracted.contains("wire_api"));
+    assert!(!extracted.contains("mcp_servers"));
+    assert!(!extracted.contains("[mcp"));
+    assert!(!extracted.contains("experimental_bearer_token"));
+    assert!(!extracted.contains("sk-live-secret"));
+    assert!(!extracted.contains("model_catalog_json"));
+    assert!(extracted.contains("disable_response_storage = true"));
+}
+
+#[test]
 fn capture_codex_temp_launch_snapshot_persists_auth_and_config() {
     let mut config = MultiAppConfig::default();
     config.ensure_app(&AppType::Codex);
@@ -382,6 +418,39 @@ fn validate_provider_settings_allows_blank_config_for_official_codex() {
 
     ProviderService::validate_provider_settings(&AppType::Codex, &provider)
         .expect("official Codex provider should not require a base_url");
+}
+
+#[test]
+#[serial]
+fn official_codex_live_write_strips_stale_unified_bucket_when_disabled() {
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+        .expect("create Codex config dir");
+
+    let stale_config = crate::codex_config::inject_codex_unified_session_bucket(
+        "model_reasoning_effort = \"medium\"\n",
+    )
+    .expect("build stale unified config");
+    let mut provider = Provider::with_id(
+        "official".to_string(),
+        "OpenAI Official".to_string(),
+        json!({
+            "auth": {},
+            "config": stale_config
+        }),
+        None,
+    );
+    provider.category = Some("official".to_string());
+
+    ProviderService::write_codex_live_force(&provider, None, false)
+        .expect("write official live config");
+
+    let live = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+        .expect("read live config");
+    assert!(!live.contains("model_provider = \"custom\""));
+    assert!(!live.contains("[model_providers.custom]"));
+    assert!(live.contains("model_reasoning_effort = \"medium\""));
 }
 
 #[test]
@@ -4405,7 +4474,7 @@ fn provider_add_tolerates_invalid_codex_common_snippet_during_storage_normalizat
 
 #[test]
 #[serial]
-fn codex_switch_extracts_common_snippet_preserving_mcp_servers() {
+fn codex_switch_excludes_mcp_servers_from_common_snippet_and_provider_snapshot() {
     let temp_home = TempDir::new().expect("create temp home");
     let _env = TestEnvGuard::isolated(temp_home.path());
 
@@ -4471,12 +4540,8 @@ base_url = "http://localhost:8080"
         "should keep top-level common config"
     );
     assert!(
-        extracted.contains("[mcp_servers.my_server]"),
-        "should keep mcp_servers table"
-    );
-    assert!(
-        extracted.contains("base_url = \"http://localhost:8080\""),
-        "should keep mcp_servers.* base_url"
+        !extracted.contains("mcp_servers"),
+        "MCP is projected from its database SSOT and must not enter common config"
     );
     assert!(
         !extracted
@@ -4493,6 +4558,20 @@ base_url = "http://localhost:8080"
     assert!(
         !extracted.contains("[model_providers"),
         "should remove entire model_providers table"
+    );
+
+    let previous_provider = cfg
+        .get_manager(&AppType::Codex)
+        .and_then(|manager| manager.providers.get("p1"))
+        .expect("previous provider snapshot");
+    let previous_config = previous_provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .expect("previous provider config");
+    assert!(
+        !previous_config.contains("mcp_servers"),
+        "live-only MCP projection must not be persisted into a provider snapshot"
     );
 }
 
