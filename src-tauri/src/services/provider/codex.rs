@@ -510,9 +510,19 @@ impl ProviderService {
                 profile,
             )?;
         let is_official = Self::codex_live_write_category(provider) == Some("official");
-        // Mirror upstream write_codex_live_for_provider: official providers own
-        // auth.json; third-party providers write auth.json unless
-        // preserve_codex_official_auth_on_switch is set (then auth.json is
+        // Align with write_codex_live_for_provider (and upstream farion1231/cc-switch):
+        // when unified Codex session history is enabled, rewrite official live
+        // config through the shared `custom` model_provider bucket so third-party
+        // sessions remain resumeable. Provider DB templates stay clean (stripped
+        // on backfill); only ~/.codex/config.toml is injected.
+        let live_config_text = if is_official && crate::settings::unify_codex_session_history() {
+            crate::codex_config::inject_codex_unified_session_bucket(&prepared_config.config_text)?
+        } else {
+            prepared_config.config_text.clone()
+        };
+
+        // Official providers own auth.json; third-party providers write auth.json
+        // unless preserve_codex_official_auth_on_switch is set (then auth.json is
         // preserved and the API key rides in config.toml's bearer token).
         let should_write_auth = is_official
             || (!force_sync && !crate::settings::preserve_codex_official_auth_on_switch());
@@ -537,12 +547,9 @@ impl ProviderService {
         // When auth.json is preserved (third-party + preserve flag) the API key
         // is injected into config.toml as an experimental_bearer_token instead.
         let config_text = if should_write_auth {
-            prepared_config.config_text.clone()
+            live_config_text
         } else {
-            crate::codex_config::prepare_codex_provider_live_config(
-                &write_auth,
-                &prepared_config.config_text,
-            )?
+            crate::codex_config::prepare_codex_provider_live_config(&write_auth, &live_config_text)?
         };
 
         // auth.json follows Preserve/Write/Delete (no merge): a switch always
