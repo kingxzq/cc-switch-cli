@@ -20,7 +20,7 @@ use crate::{
         app,
         app::{
             Action, App, ConfigItem, ConfirmAction, ConfirmOverlay, EditorKind, EditorSubmit,
-            Focus, Overlay, TextInputState, TextSubmit, UsagePane,
+            Focus, Overlay, SettingsItem, TextInputState, TextSubmit, UsagePane,
         },
         data::{
             ConfigSnapshot, McpSnapshot, ModelPricingRow, ModelPricingSnapshot,
@@ -3323,6 +3323,13 @@ fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing `{needle}` in:\n{text}"))
 }
 
+fn contains_continuous_divider_row(line: &str) -> bool {
+    line.split('│').any(|segment| {
+        let divider = segment.trim();
+        divider.contains("────") && divider.chars().all(|ch| ch == '─')
+    })
+}
+
 fn column_in_line(line: &str, needle: &str) -> usize {
     line.find(needle)
         .unwrap_or_else(|| panic!("missing `{needle}` in line:\n{line}"))
@@ -4067,6 +4074,98 @@ fn settings_page_shows_managed_accounts_summary() {
         "{all}"
     );
     assert!(all.contains("default@example.com"), "{all}");
+}
+
+#[test]
+fn settings_page_groups_items_with_unlabeled_dividers() {
+    let _lock = lock_env();
+    let _lang = use_test_language(Language::English);
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::Settings;
+    app.focus = Focus::Content;
+
+    let buf = render_with_size(&app, &minimal_data(&app.app_type), 100, 32);
+    let content = content_text(&app, &buf);
+    let dividers = content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| contains_continuous_divider_row(line).then_some(idx))
+        .collect::<Vec<_>>();
+    let managed_accounts = line_index(&content, texts::tui_settings_managed_accounts_title());
+    let editor = line_index(&content, texts::tui_settings_preferred_editor_label());
+    let visible_apps = line_index(&content, texts::tui_settings_visible_apps_mode_label());
+    let openclaw_dir = line_index(&content, texts::tui_settings_openclaw_config_dir_label());
+    let claude_integration = line_index(&content, texts::enable_claude_plugin_integration_label());
+    let codex_history = line_index(&content, texts::codex_unified_session_history_label());
+    let proxy = line_index(&content, texts::tui_config_item_proxy());
+
+    assert_eq!(dividers.len(), 3, "{content}");
+    assert!(
+        managed_accounts < editor && editor < dividers[0],
+        "{content}"
+    );
+    assert!(
+        dividers[0] < visible_apps && openclaw_dir < dividers[1],
+        "{content}"
+    );
+    assert!(
+        dividers[1] < claude_integration && codex_history < dividers[2],
+        "{content}"
+    );
+    assert!(dividers[2] < proxy, "{content}");
+    assert!(
+        !content.lines().any(|line| {
+            line.contains(texts::tui_settings_header_setting())
+                && line.contains(texts::tui_settings_header_value())
+        }),
+        "table header should be absent:\n{content}"
+    );
+    for label in ["General", "Applications", "Integrations", "System"] {
+        assert!(!content.contains(label), "unexpected {label}:\n{content}");
+    }
+}
+
+#[test]
+fn settings_section_rows_do_not_shift_selection_or_break_narrow_scrolling() {
+    let _lock = lock_env();
+    let _lang = use_test_language(Language::English);
+    let _no_color = EnvGuard::set("NO_COLOR", "1");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::Settings;
+    app.focus = Focus::Content;
+    app.settings_idx = SettingsItem::ALL
+        .iter()
+        .position(|item| matches!(item, SettingsItem::CheckForUpdates))
+        .expect("CheckForUpdates missing from SettingsItem::ALL");
+
+    let buf = render_with_size(&app, &minimal_data(&app.app_type), 50, 18);
+    let update_value = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let selected_y = (0..buf.area.height)
+        .find(|y| line_at(&buf, *y).contains(&update_value))
+        .unwrap_or_else(|| {
+            panic!(
+                "selected setting should scroll into view:\n{}",
+                all_text(&buf)
+            )
+        });
+    let divider_y = (0..buf.area.height)
+        .filter(|y| contains_continuous_divider_row(&line_at(&buf, *y)))
+        .next_back()
+        .unwrap_or_else(|| panic!("last divider should stay visible:\n{}", all_text(&buf)));
+
+    assert!(
+        (0..buf.area.width).any(|x| buf[(x, selected_y)].modifier.contains(Modifier::REVERSED)),
+        "selected setting should own the highlight:\n{}",
+        all_text(&buf)
+    );
+    assert!(
+        (0..buf.area.width).all(|x| !buf[(x, divider_y)].modifier.contains(Modifier::REVERSED)),
+        "section rows must not be selectable:\n{}",
+        all_text(&buf)
+    );
 }
 
 #[test]

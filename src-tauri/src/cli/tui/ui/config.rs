@@ -1,7 +1,52 @@
 use super::*;
 
-use crate::cli::tui::app::LocalProxySettingsItem;
+use crate::cli::tui::app::{LocalProxySettingsItem, SettingsItem};
 use unicode_width::UnicodeWidthStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Applications,
+    Integrations,
+    System,
+}
+
+fn settings_section(item: SettingsItem) -> SettingsSection {
+    match item {
+        SettingsItem::ManagedAccounts
+        | SettingsItem::Language
+        | SettingsItem::Theme
+        | SettingsItem::Icons
+        | SettingsItem::PreferredEditor => SettingsSection::General,
+        SettingsItem::VisibleAppsMode
+        | SettingsItem::VisibleApps
+        | SettingsItem::OpenClawConfigDir => SettingsSection::Applications,
+        SettingsItem::SkipClaudeOnboarding
+        | SettingsItem::ClaudePluginIntegration
+        | SettingsItem::CodexUnifiedSessionHistory => SettingsSection::Integrations,
+        SettingsItem::Proxy | SettingsItem::CheckForUpdates => SettingsSection::System,
+    }
+}
+
+fn settings_table_row_index(selected_idx: usize) -> usize {
+    let selected_idx = selected_idx.min(SettingsItem::ALL.len().saturating_sub(1));
+    let mut rendered_idx = 0;
+    let mut current_section = None;
+
+    for (item_idx, item) in SettingsItem::ALL.iter().copied().enumerate() {
+        let section = settings_section(item);
+        if current_section.is_some_and(|current| current != section) {
+            rendered_idx += 1;
+        }
+        current_section = Some(section);
+        if item_idx == selected_idx {
+            return rendered_idx;
+        }
+        rendered_idx += 1;
+    }
+
+    0
+}
 
 pub(super) fn config_items_filtered(app: &App) -> Vec<ConfigItem> {
     app::visible_config_items(&app.filter, &app.app_type)
@@ -3430,24 +3475,29 @@ pub(super) fn render_settings(
     );
     let table_area = inset_left(body, CONTENT_INSET_LEFT);
 
-    let raw_label_col_width = field_label_column_width(
-        rows_data
-            .iter()
-            .map(|(label, _value)| label.as_str())
-            .chain(std::iter::once(texts::tui_settings_header_setting())),
-        0,
-    );
+    let raw_label_col_width =
+        field_label_column_width(rows_data.iter().map(|(label, _value)| label.as_str()), 0);
     let label_col_width = raw_label_col_width.min(table_area.width.saturating_sub(9));
 
-    let header = Row::new(vec![
-        Cell::from(texts::tui_settings_header_setting()),
-        Cell::from(texts::tui_settings_header_value()),
-    ])
-    .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
+    let section_style = Style::default().fg(theme.dim);
+    let section_rule = "─".repeat(usize::from(table_area.width));
+    let mut rows = Vec::with_capacity(rows_data.len() + 3);
+    let mut current_section = None;
+    for (item, (label, value)) in SettingsItem::ALL.iter().copied().zip(&rows_data) {
+        let section = settings_section(item);
+        if current_section.is_some_and(|current| current != section) {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(section_rule.clone()),
+                    Cell::from(section_rule.clone()),
+                ])
+                .style(section_style),
+            );
+        }
+        current_section = Some(section);
 
-    let rows = rows_data.iter().map(|(label, value)| {
         let value = bounded_trimmed_text_for_display(value);
-        Row::new(vec![
+        rows.push(Row::new(vec![
             Cell::from(truncate_to_display_width(label, label_col_width)),
             Cell::from(truncated_value_cell(
                 &value,
@@ -3455,20 +3505,23 @@ pub(super) fn render_settings(
                 label_col_width,
                 theme,
             )),
-        ])
-    });
+        ]));
+    }
 
     let table = Table::new(
         rows,
-        [Constraint::Length(label_col_width), Constraint::Min(10)],
+        [
+            Constraint::Length(label_col_width.saturating_add(1)),
+            Constraint::Min(10),
+        ],
     )
-    .header(header)
+    .column_spacing(0)
     .block(Block::default().borders(Borders::NONE))
     .row_highlight_style(selection_style(theme))
     .highlight_symbol(highlight_symbol(theme));
 
     let mut state = TableState::default();
-    state.select(Some(app.settings_idx));
+    state.select(Some(settings_table_row_index(app.settings_idx)));
     frame.render_stateful_widget(table, table_area, &mut state);
 }
 
