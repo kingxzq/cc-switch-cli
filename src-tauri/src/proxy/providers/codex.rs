@@ -91,8 +91,7 @@ pub fn should_convert_codex_responses_to_chat(provider: &Provider, endpoint: &st
     ) && codex_provider_uses_chat_completions(provider)
 }
 
-
-/// Whether a converted Codex Responses request may send \`prompt_cache_key\` to
+/// Whether a converted Codex Responses request may send `prompt_cache_key` to
 /// its Chat Completions upstream. Unknown OpenAI-compatible gateways default to
 /// false because many reject unsupported request fields with HTTP 400.
 pub fn should_send_codex_chat_prompt_cache_key(provider: &Provider) -> bool {
@@ -131,7 +130,7 @@ pub fn should_send_codex_chat_prompt_cache_key(provider: &Provider) -> bool {
     match url.host_str() {
         Some("api.openai.com") => true,
         Some("api.kimi.com") => {
-            let path = url.path().trim_end_matches("/");
+            let path = url.path().trim_end_matches('/');
             path == "/coding" || path.starts_with("/coding/")
         }
         _ => false,
@@ -691,7 +690,7 @@ experimental_bearer_token = "sk-config-key"
     }
 
     #[test]
-    fn test_codex_provider_uses_chat_completions_from_active_wire_api() {
+    fn prompt_cache_routing_auto_enables_known_upstreams_only() {
         let kimi = create_provider(json!({
             "config": r#"
 model_provider = "custom"
@@ -785,7 +784,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn test_codex_provider_uses_chat_completions_from_active_wire_api_original() {
+    fn test_codex_provider_uses_chat_completions_from_active_wire_api() {
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "chat_only"
