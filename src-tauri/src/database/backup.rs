@@ -12,6 +12,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
@@ -143,6 +145,30 @@ const SYNC_PRESERVATION_POLICY: SyncPreservationPolicy = SyncPreservationPolicy 
 };
 
 impl Database {
+    /// Create the normal SQLite snapshot before a schema migration has
+    /// quiesced an older daemon. SQLite's online backup API gives us a
+    /// consistent source snapshot while the daemon remains available; if the
+    /// backup directory is unwritable or the disk is full, initialization can
+    /// fail without taking a working proxy offline.
+    pub(crate) fn backup_database_path(database_path: &Path) -> Result<Option<PathBuf>, AppError> {
+        if !database_path.exists() {
+            return Ok(None);
+        }
+
+        let conn =
+            Connection::open_with_flags(database_path, super::readonly_database_open_flags())
+                .map_err(|error| AppError::Database(error.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| AppError::Database(error.to_string()))?;
+
+        let snapshot_source = Self {
+            conn: Mutex::new(conn),
+            runtime_key: format!("file:{}", database_path.display()),
+            db_path: Some(database_path.to_path_buf()),
+        };
+        snapshot_source.backup_database_file()
+    }
+
     /// 导出为 SQL 字符串（内存操作，不写文件）
     pub fn export_sql_string(&self) -> Result<String, AppError> {
         let snapshot = self.snapshot_to_memory()?;

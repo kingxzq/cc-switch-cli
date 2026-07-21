@@ -130,6 +130,7 @@ pub enum Action {
         range: data::UsageCustomRange,
     },
     UsageRefresh,
+    UsageRebuildCodex,
     UsageLogDetailRefresh {
         rowid: i64,
     },

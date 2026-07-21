@@ -396,12 +396,17 @@ pub(crate) enum UsagePricingLoadError {
 
 pub(crate) enum SessionUsageSyncReq {
     Run { request_id: u64 },
+    RebuildCodex { request_id: u64 },
 }
 
 pub(crate) enum SessionUsageSyncMsg {
     Finished {
         request_id: u64,
         result: Result<(), String>,
+    },
+    CodexRebuilt {
+        request_id: u64,
+        result: Result<crate::services::session_usage::SessionSyncResult, String>,
     },
 }
 

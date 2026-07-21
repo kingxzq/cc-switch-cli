@@ -2189,6 +2189,152 @@ fn manual_usage_refresh_syncs_sessions_before_requerying() {
 }
 
 #[test]
+fn codex_usage_rebuild_queues_once_and_requeries_with_result_toast() {
+    let mut terminal = TuiTerminal::new_for_test().expect("create terminal");
+    let mut app = App::new(Some(AppType::Codex));
+    app.route = route::Route::Usage;
+    let mut data = UiData::default();
+    let mut cache = UiDataByAppCache::default();
+    let mut proxy_loading = RequestTracker::default();
+    let mut webdav_loading = RequestTracker::default();
+    let mut update_check = RequestTracker::default();
+    let mut session_usage_sync = RequestTracker::default();
+    let (usage_tx, usage_rx) = mpsc::channel();
+    let (sync_tx, sync_rx) = mpsc::channel();
+
+    handle_tui_action(
+        &mut terminal,
+        &mut app,
+        &mut data,
+        &mut cache,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &mut proxy_loading,
+        None,
+        None,
+        None,
+        &mut webdav_loading,
+        None,
+        &mut update_check,
+        None,
+        None,
+        None,
+        Some(&usage_tx),
+        Some((&sync_tx, &mut session_usage_sync)),
+        Action::UsageRebuildCodex,
+    )
+    .expect("Codex rebuild should queue");
+
+    assert!(matches!(
+        sync_rx.recv().expect("rebuild request"),
+        SessionUsageSyncReq::RebuildCodex { request_id: 1 }
+    ));
+    assert!(app.usage.codex_usage_rebuilding());
+
+    handle_tui_action(
+        &mut terminal,
+        &mut app,
+        &mut data,
+        &mut cache,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &mut proxy_loading,
+        None,
+        None,
+        None,
+        &mut webdav_loading,
+        None,
+        &mut update_check,
+        None,
+        None,
+        None,
+        Some(&usage_tx),
+        Some((&sync_tx, &mut session_usage_sync)),
+        Action::UsageRebuildCodex,
+    )
+    .expect("duplicate rebuild should be ignored");
+    assert!(sync_rx.try_recv().is_err());
+
+    handle_session_usage_sync_msg(
+        &mut app,
+        &mut data,
+        &mut cache,
+        &mut session_usage_sync,
+        Some(&usage_tx),
+        SessionUsageSyncMsg::CodexRebuilt {
+            request_id: 1,
+            result: Ok(crate::services::session_usage::SessionSyncResult {
+                imported: 7,
+                suspected_duplicates: 2,
+                deferred_files: 1,
+                errors: vec!["one parse error".to_string()],
+                ..Default::default()
+            }),
+        },
+    );
+
+    assert!(!app.usage.codex_usage_rebuilding());
+    assert!(matches!(
+        usage_rx.recv().expect("usage query after rebuild"),
+        UsagePricingReq::Load {
+            app_type: AppType::Codex,
+            range: data::UsageRangePreset::SevenDays,
+            ..
+        }
+    ));
+    let toast = app.toast.as_ref().expect("rebuild result toast");
+    assert_eq!(toast.kind, ToastKind::Warning);
+    assert!(toast.message.contains('7'));
+    assert!(toast.message.contains('2'));
+    assert!(toast.message.contains('1'));
+}
+
+#[test]
+fn failed_codex_usage_rebuild_still_invalidates_and_requeries() {
+    let mut app = App::new(Some(AppType::Codex));
+    app.route = route::Route::Usage;
+    app.usage.start_codex_usage_rebuild();
+    let mut data = UiData::default();
+    let mut cache = UiDataByAppCache::default();
+    let mut tracker = RequestTracker::default();
+    let request_id = tracker.start();
+    let (tx, rx) = mpsc::channel();
+
+    handle_session_usage_sync_msg(
+        &mut app,
+        &mut data,
+        &mut cache,
+        &mut tracker,
+        Some(&tx),
+        SessionUsageSyncMsg::CodexRebuilt {
+            request_id,
+            result: Err("synthetic reimport failure".to_string()),
+        },
+    );
+
+    assert!(!app.usage.codex_usage_rebuilding());
+    assert!(matches!(
+        rx.recv().expect("usage query after failed rebuild"),
+        UsagePricingReq::Load {
+            app_type: AppType::Codex,
+            range: data::UsageRangePreset::SevenDays,
+            ..
+        }
+    ));
+    assert!(matches!(
+        app.toast.as_ref(),
+        Some(toast) if toast.kind == ToastKind::Error
+            && toast.message.contains("synthetic reimport failure")
+    ));
+}
+
+#[test]
 fn pricing_manual_refresh_uses_fixed_async_query_without_session_sync() {
     let mut terminal = TuiTerminal::new_for_test().expect("create terminal");
     let mut app = App::new(Some(AppType::Claude));

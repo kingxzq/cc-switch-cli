@@ -709,6 +709,7 @@ pub struct UsageState {
     log_detail_pending: Option<u64>,
     refresh_log_page_after_aggregate: bool,
     manual_session_refreshing: bool,
+    codex_usage_rebuilding: bool,
     loading_ranges: HashSet<(AppType, crate::cli::tui::data::UsageRangePreset)>,
 }
 
@@ -725,6 +726,7 @@ impl Default for UsageState {
             log_detail_pending: None,
             refresh_log_page_after_aggregate: false,
             manual_session_refreshing: false,
+            codex_usage_rebuilding: false,
             loading_ranges: HashSet::new(),
         }
     }
@@ -793,6 +795,20 @@ impl UsageState {
 
     pub(crate) fn manual_session_refreshing(&self) -> bool {
         self.manual_session_refreshing
+    }
+
+    pub(crate) fn start_codex_usage_rebuild(&mut self) {
+        self.codex_usage_rebuilding = true;
+        self.manual_session_refreshing = true;
+    }
+
+    pub(crate) fn finish_codex_usage_rebuild(&mut self) {
+        self.codex_usage_rebuilding = false;
+        self.manual_session_refreshing = false;
+    }
+
+    pub(crate) fn codex_usage_rebuilding(&self) -> bool {
+        self.codex_usage_rebuilding
     }
 
     pub(crate) fn sync_current_log_selection(
@@ -3252,6 +3268,7 @@ pub enum ConfirmAction {
     ProviderApiFormatProxyNotice,
     CommonConfigNotice,
     UsageQueryNotice,
+    RebuildCodexUsage,
     ManagedAuthCancelLogin,
     ProxyEnableAndAutoFailover {
         app_type: AppType,

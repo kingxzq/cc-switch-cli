@@ -64,7 +64,7 @@ static DATABASE_PERMISSION_CHECK: Once = Once::new();
 /// 注意：本库 schema 与上游项目同步（WebDAV 亦会整库同步），本仓库不得自行
 /// 加表/加列或提升版本号；本地新增的持久化需求一律放独立 sidecar 存储
 /// （如 session_manager::scan_cache_store）。
-pub(crate) const SCHEMA_VERSION: i32 = 13;
+pub(crate) const SCHEMA_VERSION: i32 = 16;
 
 fn database_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -453,6 +453,20 @@ impl Database {
     ///
     /// 数据库文件位于 `~/.cc-switch/cc-switch.db`
     pub fn init() -> Result<Self, AppError> {
+        Self::init_impl(true)
+    }
+
+    /// Daemon startup already owns `daemon.pid`; the type-level lease proves
+    /// there cannot be an older daemon to quiesce before this initialization.
+    #[cfg(unix)]
+    pub(crate) fn init_for_daemon(
+        _pidfile: &crate::daemon::pidfile::PidFile,
+    ) -> Result<Self, AppError> {
+        Self::init_impl(false)
+    }
+
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn init_impl(quiesce_daemon: bool) -> Result<Self, AppError> {
         if let Err(err) = crate::config::validate_config_dir() {
             log::warn!("拒绝初始化数据库：配置目录校验失败: {err}");
             return Err(err);
@@ -460,6 +474,33 @@ impl Database {
         warn_insecure_permissions_once();
 
         let db_path = database_path()?;
+        let migration_probe = Self::existing_database_needs_migration(&db_path)?;
+
+        // Lock order is daemon.pid -> database init lock. Probing is strictly
+        // read-only. The migration coordinator snapshots the live database
+        // before it sends Shutdown, so backup failure cannot take a working
+        // proxy offline. An old daemon does not know the v16 session-import
+        // file lock, so it must fully exit before the reset.
+        #[cfg(unix)]
+        let (mut daemon_migration_guard, pre_migration_backup_created) = if migration_probe {
+            if quiesce_daemon {
+                let guard = crate::daemon::migration::quiesce_for_database_migration(&db_path)
+                    .map_err(AppError::Message)?;
+                let backup_created = guard.backup_created();
+                (Some(guard), backup_created)
+            } else {
+                (None, Self::create_pre_migration_backup(&db_path)?)
+            }
+        } else {
+            (None, false)
+        };
+
+        #[cfg(not(unix))]
+        let pre_migration_backup_created = if migration_probe {
+            Self::create_pre_migration_backup(&db_path)?
+        } else {
+            false
+        };
 
         // 确保父目录存在
         if let Some(parent) = db_path.parent() {
@@ -467,10 +508,27 @@ impl Database {
         }
 
         #[cfg(unix)]
-        let _init_lock = db_path
+        let init_lock = db_path
             .parent()
             .map(acquire_database_init_lock)
             .transpose()?;
+
+        // Re-check after taking the init lock. This closes the probe-to-lock
+        // race with an already-running v15 TUI/foreground proxy and also
+        // protects daemon-owned startup, which intentionally bypasses
+        // self-quiescence because it already owns daemon.pid.
+        #[cfg(unix)]
+        if Self::existing_database_needs_migration(&db_path)? {
+            if let Err(error) =
+                crate::daemon::migration::ensure_no_external_database_holders(&db_path)
+            {
+                drop(init_lock);
+                if let Some(guard) = daemon_migration_guard {
+                    guard.resume_after_safe_abort();
+                }
+                return Err(AppError::Message(error));
+            }
+        }
 
         // 新建数据库文件时以 0o600 原子创建，已有文件的权限由 prompt_fix_permissions 处理
         #[cfg(unix)]
@@ -533,7 +591,7 @@ impl Database {
             db_path: Some(db_path.clone()),
         };
 
-        {
+        let version = {
             let conn = lock_conn!(db.conn);
             let version = Self::get_user_version(&conn)?;
             drop(conn);
@@ -542,15 +600,36 @@ impl Database {
                 return Err(Self::future_schema_error(version));
             }
 
-            if version > 0 && version < SCHEMA_VERSION {
-                log::info!(
-                    "Creating pre-migration database backup (v{version} -> v{SCHEMA_VERSION})"
-                );
-                db.backup_database_file().map_err(|err| {
-                    AppError::Database(format!(
-                        "Pre-migration backup failed; database migration was not started: {err}"
-                    ))
-                })?;
+            version
+        };
+
+        // New-version foreground processes and daemons rendezvous here before
+        // any schema reset. Keep the same guard through backup, migration, and
+        // startup maintenance so no session importer can publish an old cursor.
+        let migration_sync_guard = if version < SCHEMA_VERSION {
+            Some(crate::services::session_usage::acquire_session_sync_guard(
+                &db,
+            )?)
+        } else {
+            None
+        };
+
+        if version > 0 && version < SCHEMA_VERSION && !pre_migration_backup_created {
+            log::info!("Creating pre-migration database backup (v{version} -> v{SCHEMA_VERSION})");
+            db.backup_database_file().map_err(|err| {
+                AppError::Database(format!(
+                    "Pre-migration backup failed; database migration was not started: {err}"
+                ))
+            })?;
+        }
+
+        #[cfg(unix)]
+        if version < SCHEMA_VERSION {
+            if let Some(guard) = daemon_migration_guard.as_mut() {
+                // From this point create_tables/apply_schema_migrations may
+                // mutate the database. A previous binary must not be resumed
+                // automatically if one of those operations fails.
+                guard.suppress_safe_abort_resume();
             }
         }
 
@@ -566,7 +645,50 @@ impl Database {
         db.ensure_model_pricing_seeded()?;
         db.run_usage_maintenance("startup");
 
+        drop(migration_sync_guard);
+
+        #[cfg(unix)]
+        {
+            // The replacement daemon must be allowed to take both locks before
+            // it starts and restores the workers captured by the resume plan.
+            drop(init_lock);
+            if let Some(guard) = daemon_migration_guard {
+                guard.resume_after_success();
+            }
+        }
+
         Ok(db)
+    }
+
+    fn create_pre_migration_backup(path: &Path) -> Result<bool, AppError> {
+        log::info!(
+            "Creating pre-migration database backup before schema changes (target v{SCHEMA_VERSION})"
+        );
+        Self::backup_database_path(path)
+            .map(|backup| backup.is_some())
+            .map_err(|error| {
+                AppError::Database(format!(
+                    "Pre-migration backup failed; database migration was not started: {error}"
+                ))
+            })
+    }
+
+    pub(crate) fn existing_database_needs_migration(path: &Path) -> Result<bool, AppError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => validate_existing_database_file(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(AppError::io(path, error)),
+        }
+
+        let conn = Connection::open_with_flags(path, readonly_database_open_flags())
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let version = Self::get_user_version(&conn)?;
+        if version >= SCHEMA_VERSION {
+            return Ok(false);
+        }
+        Self::has_user_tables(&conn)
     }
 
     /// 打开当前 schema 的只读快照连接。
@@ -825,6 +947,16 @@ impl Database {
             conn: Mutex::new(conn),
             runtime_key: self.runtime_key.clone(),
             db_path: Some(db_path),
+        })
+    }
+
+    /// Lock-file path shared by every process that imports or rebuilds session
+    /// usage for this database. In-memory databases need only the process lock.
+    pub(crate) fn session_usage_lock_path(&self) -> Option<PathBuf> {
+        self.db_path.as_ref().map(|path| {
+            let mut lock_name = path.as_os_str().to_os_string();
+            lock_name.push(".session-usage.lock");
+            PathBuf::from(lock_name)
         })
     }
 }

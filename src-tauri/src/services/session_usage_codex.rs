@@ -9,7 +9,7 @@
 //! ```
 //!
 //! ## 解析的事件类型
-//! - `session_meta` → 提取 session_id
+//! - `session_meta` → 提取唯一 thread_id（子代理的 session_id 指向父线程）
 //! - `turn_context` → 提取当前 model
 //! - `event_msg` (type=token_count) → 提取累计 token 用量，计算 delta
 
@@ -19,18 +19,27 @@ use crate::error::AppError;
 use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    cached_model_pricing, get_sync_state, metadata_modified_nanos, update_sync_state_conn,
-    PricingCache, SessionSyncResult, SESSION_LOG_COMMIT_BATCH,
+    cached_model_pricing, get_sync_state, metadata_modified_nanos, update_sync_state,
+    update_sync_state_conn, PricingCache, SessionSyncResult, SESSION_LOG_COMMIT_BATCH,
 };
-use crate::services::session_usage_driver::{save_resume_hint, scan_jsonl_incremental};
-use crate::services::usage_stats::{should_skip_session_insert, DedupKey};
+use crate::services::session_usage_driver::{
+    save_resume_hint, scan_jsonl_incremental, unchanged_jsonl_identity_is_suspicious,
+};
+use crate::services::usage_stats::{
+    has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+};
 use crate::session_manager::scan_cache_store::{ScanCacheStore, SyncResumeHint};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
+
+const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,11 +50,83 @@ struct CumulativeTokens {
 }
 
 /// 单次 API 调用的 token 增量
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DeltaTokens {
     input: u32,
     cached_input: u32,
     output: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenCountersSignature {
+    input: Option<u64>,
+    cached_input: Option<u64>,
+    output: Option<u64>,
+    reasoning_output: Option<u64>,
+    total: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenUsageSignature {
+    total: Option<TokenCountersSignature>,
+    last: Option<TokenCountersSignature>,
+}
+
+#[derive(Debug, Clone)]
+enum ParentResolution {
+    None,
+    Parent(String),
+    Deferred(String),
+}
+
+#[derive(Debug)]
+struct ParsedCodexFile {
+    line_offset: i64,
+    has_billable_tokens: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RootMeta {
+    timestamp: Option<DateTime<Utc>>,
+    parent: ParentResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingReason {
+    MissingParent(String),
+    Stable(String),
+    Retryable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingEntry {
+    modified: i64,
+    size: u64,
+    reason: PendingReason,
+}
+
+#[derive(Debug, Default)]
+struct CodexReplayCaches {
+    parent_signatures: HashMap<(PathBuf, i64), Vec<TokenUsageSignature>>,
+    pending: HashMap<PathBuf, PendingEntry>,
+}
+
+static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
+
+fn replay_caches() -> &'static Mutex<CodexReplayCaches> {
+    CODEX_REPLAY_CACHES.get_or_init(|| Mutex::new(CodexReplayCaches::default()))
+}
+
+pub(crate) fn clear_codex_replay_caches() {
+    if let Ok(mut caches) = replay_caches().lock() {
+        *caches = CodexReplayCaches::default();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ReplayPhase {
+    Matching { parent_offset: usize },
+    Live,
 }
 
 impl DeltaTokens {
@@ -60,10 +141,10 @@ impl DeltaTokens {
 /// 无需从第 1 行重放历史事件来重建 `prev_total`/`event_index`。
 #[derive(Debug, Serialize, Deserialize)]
 struct FileParseState {
-    session_id: Option<String>,
     current_model: String,
     prev_total: Option<CumulativeTokens>,
     event_index: u32,
+    replay_phase: ReplayPhase,
 }
 
 /// 扫描阶段收集的待写记录：先扫描收集、后批量写库，读文件期间不持有连接锁。
@@ -75,6 +156,258 @@ struct PendingCodexEntry {
     /// 在扫描（解析）阶段就定死的入库时间戳（Unix 秒）。缺失/非法 timestamp 的
     /// now() 回退发生在入队处而非写库阶段，避免两阶段延迟污染退化输入的时间。
     created_at: i64,
+}
+
+type RolloutIndex = HashMap<String, Vec<PathBuf>>;
+
+#[derive(Debug, Default)]
+struct CodexFileSyncResult {
+    imported: u32,
+    skipped: u32,
+    suspected_duplicates: u32,
+    deferred: bool,
+}
+
+fn is_rollout_filename(file_name: &str) -> bool {
+    if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
+        return false;
+    }
+    let stem = file_name.trim_end_matches(".jsonl");
+    stem.get(stem.len().saturating_sub(36)..)
+        .is_some_and(|candidate| uuid::Uuid::parse_str(candidate).is_ok())
+}
+
+fn is_codex_cursor_path(file_path: &str, codex_dir: &Path) -> bool {
+    let path = Path::new(file_path);
+    let file_name = file_path.rsplit(['/', '\\']).next().unwrap_or_default();
+    if !is_rollout_filename(file_name) {
+        return false;
+    }
+
+    if path.starts_with(codex_dir.join("sessions"))
+        || path.starts_with(codex_dir.join("archived_sessions"))
+    {
+        return true;
+    }
+
+    file_path
+        .replace('\\', "/")
+        .split('/')
+        .any(|segment| matches!(segment, "sessions" | "archived_sessions"))
+}
+
+fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("查询表 {table} 失败: {error}")))
+}
+
+fn sqlite_column_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("查询列 {table}.{column} 失败: {error}")))
+}
+
+pub(crate) fn reset_codex_usage_on_conn(
+    conn: &rusqlite::Connection,
+    codex_dir: &Path,
+) -> Result<(), AppError> {
+    if sqlite_table_exists(conn, "proxy_request_logs")?
+        && sqlite_column_exists(conn, "proxy_request_logs", "data_source")?
+    {
+        conn.execute(
+            "DELETE FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+        )
+        .map_err(|error| AppError::Database(format!("清理 Codex 会话明细失败: {error}")))?;
+    }
+    if sqlite_table_exists(conn, "usage_daily_rollups")?
+        && sqlite_column_exists(conn, "usage_daily_rollups", "provider_id")?
+    {
+        conn.execute(
+            "DELETE FROM usage_daily_rollups WHERE provider_id = '_codex_session'",
+            [],
+        )
+        .map_err(|error| AppError::Database(format!("清理 Codex 用量汇总失败: {error}")))?;
+    }
+    if sqlite_table_exists(conn, "session_log_sync")?
+        && sqlite_column_exists(conn, "session_log_sync", "file_path")?
+    {
+        let paths = {
+            let mut statement = conn
+                .prepare("SELECT file_path FROM session_log_sync")
+                .map_err(|error| {
+                    AppError::Database(format!("读取会话同步 cursor 失败: {error}"))
+                })?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| AppError::Database(format!("查询会话同步 cursor 失败: {error}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Database(format!("解析会话同步 cursor 失败: {error}"))
+                })?;
+            paths
+        };
+        for file_path in paths
+            .into_iter()
+            .filter(|path| is_codex_cursor_path(path, codex_dir))
+        {
+            conn.execute(
+                "DELETE FROM session_log_sync WHERE file_path = ?1",
+                [file_path],
+            )
+            .map_err(|error| AppError::Database(format!("清理 Codex 同步 cursor 失败: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
+impl Database {
+    pub(crate) fn reset_codex_usage(&self) -> Result<(), AppError> {
+        let codex_dir = get_codex_config_dir();
+        let conn = lock_conn!(self.conn);
+        conn.execute("SAVEPOINT reset_codex_usage", [])
+            .map_err(|error| AppError::Database(format!("开启 Codex 重建事务失败: {error}")))?;
+        let result = reset_codex_usage_on_conn(&conn, &codex_dir);
+        match result {
+            Ok(()) => {
+                conn.execute("RELEASE reset_codex_usage", [])
+                    .map_err(|error| {
+                        AppError::Database(format!("提交 Codex 重建事务失败: {error}"))
+                    })?;
+                drop(conn);
+                clear_codex_replay_caches();
+                Ok(())
+            }
+            Err(error) => {
+                conn.execute("ROLLBACK TO reset_codex_usage", []).ok();
+                conn.execute("RELEASE reset_codex_usage", []).ok();
+                Err(error)
+            }
+        }
+    }
+}
+
+fn non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn thread_id_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let candidate = stem.get(stem.len().checked_sub(36)?..)?;
+    uuid::Uuid::parse_str(candidate)
+        .ok()
+        .map(|value| value.hyphenated().to_string())
+}
+
+fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
+    let forked_from = non_empty_string(payload.get("forked_from_id"));
+    let spawned_from = payload
+        .get("source")
+        .and_then(|source| source.get("subagent"))
+        .and_then(|subagent| subagent.get("thread_spawn"))
+        .and_then(|spawn| non_empty_string(spawn.get("parent_thread_id")));
+
+    match (forked_from, spawned_from) {
+        (None, None) => ParentResolution::None,
+        (Some(parent), None) | (None, Some(parent)) => ParentResolution::Parent(parent),
+        (Some(forked), Some(spawned)) if forked == spawned => ParentResolution::Parent(forked),
+        (Some(forked), Some(spawned)) => ParentResolution::Deferred(format!(
+            "forked_from_id ({forked}) 与 thread_spawn.parent_thread_id ({spawned}) 不一致"
+        )),
+    }
+}
+
+fn parse_timestamp(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn parse_signature_counters(value: Option<&serde_json::Value>) -> Option<TokenCountersSignature> {
+    let value = value?.as_object()?;
+    Some(TokenCountersSignature {
+        input: value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cached_input: value
+            .get("cached_input_tokens")
+            .or_else(|| value.get("cache_read_input_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        output: value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        reasoning_output: value
+            .get("reasoning_output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        total: value
+            .get("total_tokens")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn parse_token_signature(info: &serde_json::Value) -> Option<TokenUsageSignature> {
+    let total = parse_signature_counters(info.get("total_token_usage"));
+    let last = parse_signature_counters(info.get("last_token_usage"));
+    (total.is_some() || last.is_some()).then_some(TokenUsageSignature { total, last })
+}
+
+fn get_codex_sync_state(db: &Database, file_path: &Path) -> Result<(i64, i64), AppError> {
+    let file_path_str = file_path.to_string_lossy().to_string();
+    let state = get_sync_state(db, &file_path_str)?;
+    if state != (0, 0)
+        || file_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("archived_sessions")
+    {
+        return Ok(state);
+    }
+
+    let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(state);
+    };
+    let slash_suffix = format!("/{file_name}");
+    let backslash_suffix = format!("\\{file_name}");
+    let conn = lock_conn!(db.conn);
+    let inherited = conn.query_row(
+        "SELECT last_modified, last_line_offset
+         FROM session_log_sync
+         WHERE file_path <> ?1
+           AND (substr(file_path, -length(?2)) = ?2
+                OR substr(file_path, -length(?3)) = ?3)
+         ORDER BY last_line_offset DESC, last_modified DESC
+         LIMIT 1",
+        rusqlite::params![file_path_str, slash_suffix, backslash_suffix],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    );
+    drop(conn);
+
+    match inherited {
+        Ok(inherited) => {
+            update_sync_state(db, &file_path_str, inherited.0, inherited.1)?;
+            Ok(inherited)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(state),
+        Err(error) => Err(AppError::Database(format!(
+            "查询 Codex 归档文件同步状态失败: {error}"
+        ))),
+    }
 }
 
 /// 归一化 Codex 模型名
@@ -182,16 +515,305 @@ fn parse_cumulative_tokens(total_usage: &serde_json::Value) -> Option<Cumulative
     })
 }
 
+fn root_meta_from_value(value: &serde_json::Value, root_thread_id: Option<&str>) -> RootMeta {
+    let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+    let mut parent = explicit_parent_from_meta(payload);
+
+    let meta_thread_id = non_empty_string(
+        payload
+            .get("id")
+            .or_else(|| payload.get("thread_id"))
+            .or_else(|| payload.get("threadId")),
+    );
+    if let (Some(filename_id), Some(meta_id)) = (root_thread_id, meta_thread_id) {
+        if filename_id != meta_id {
+            parent = ParentResolution::Deferred(format!(
+                "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
+            ));
+        }
+    }
+
+    if let ParentResolution::Parent(parent_id) = &mut parent {
+        match uuid::Uuid::parse_str(parent_id) {
+            Ok(value) => *parent_id = value.hyphenated().to_string(),
+            Err(_) => {
+                parent = ParentResolution::Deferred(format!(
+                    "显式 parent_thread_id 不是有效 UUID: {parent_id}"
+                ));
+            }
+        }
+    }
+    if matches!((root_thread_id, &parent), (Some(root), ParentResolution::Parent(parent_id)) if root == parent_id)
+    {
+        parent = ParentResolution::Deferred("parent_thread_id 与 root_thread_id 相同".to_string());
+    }
+
+    RootMeta {
+        timestamp: parse_timestamp(value.get("timestamp")),
+        parent,
+    }
+}
+
+fn read_root_meta(
+    file_path: &Path,
+    root_thread_id: Option<&str>,
+) -> Result<Option<RootMeta>, AppError> {
+    let file =
+        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            return Ok(Some(root_meta_from_value(&value, root_thread_id)));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_codex_file(
+    file_path: &Path,
+    _root_thread_id: Option<String>,
+) -> Result<ParsedCodexFile, AppError> {
+    let file =
+        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+    let reader = BufReader::new(file);
+    let mut prev_total: Option<CumulativeTokens> = None;
+    let mut line_offset = 0i64;
+    let mut has_billable_tokens = false;
+
+    for line_result in reader.lines() {
+        line_offset += 1;
+        let line = match line_result {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let is_event_msg = line.contains("\"event_msg\"");
+        let is_turn_context = line.contains("\"turn_context\"");
+        let is_session_meta = line.contains("\"session_meta\"");
+        if !is_event_msg && !is_turn_context && !is_session_meta {
+            continue;
+        }
+        if is_event_msg && !line.contains("\"token_count\"") {
+            continue;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+
+        match event_type {
+            "session_meta" | "turn_context" => {}
+            "event_msg" => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
+                    continue;
+                }
+                let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
+                    continue;
+                };
+                if parse_token_signature(info).is_none() {
+                    continue;
+                }
+
+                let (cumulative, is_total) = if let Some(total) = info.get("total_token_usage") {
+                    (parse_cumulative_tokens(total), true)
+                } else if let Some(last) = info.get("last_token_usage") {
+                    (parse_cumulative_tokens(last), false)
+                } else {
+                    continue;
+                };
+                let Some(cumulative) = cumulative else {
+                    continue;
+                };
+                let delta = if is_total {
+                    let delta = compute_delta(&prev_total, &cumulative);
+                    prev_total = Some(cumulative);
+                    delta
+                } else {
+                    DeltaTokens {
+                        input: cumulative.input as u32,
+                        cached_input: cumulative.cached_input as u32,
+                        output: cumulative.output as u32,
+                    }
+                };
+                let delta = DeltaTokens {
+                    cached_input: delta.cached_input.min(delta.input),
+                    ..delta
+                };
+                if !delta.is_zero() {
+                    has_billable_tokens = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ParsedCodexFile {
+        line_offset,
+        has_billable_tokens,
+    })
+}
+
+fn parent_signatures_before(
+    parent_path: &Path,
+    cutoff: DateTime<Utc>,
+) -> Result<Vec<TokenUsageSignature>, String> {
+    let cache_key = (parent_path.to_path_buf(), cutoff.timestamp_micros());
+    if let Ok(caches) = replay_caches().lock() {
+        if let Some(signatures) = caches.parent_signatures.get(&cache_key) {
+            return Ok(signatures.clone());
+        }
+    }
+
+    let file = fs::File::open(parent_path)
+        .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
+    let mut signatures = Vec::new();
+    let mut max_timestamp: Option<DateTime<Utc>> = None;
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let timestamp = parse_timestamp(value.get("timestamp"));
+        if let Some(timestamp) = timestamp {
+            max_timestamp = Some(max_timestamp.map_or(timestamp, |current| current.max(timestamp)));
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
+            || value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("token_count")
+        {
+            continue;
+        }
+        let Some(info) = value
+            .get("payload")
+            .and_then(|payload| payload.get("info"))
+            .filter(|info| !info.is_null())
+        else {
+            continue;
+        };
+        let Some(signature) = parse_token_signature(info) else {
+            continue;
+        };
+        let Some(timestamp) = timestamp else {
+            return Err(format!(
+                "父 rollout {} 的 token_count 缺少有效 timestamp",
+                parent_path.display()
+            ));
+        };
+        if timestamp <= cutoff {
+            signatures.push(signature);
+        }
+    }
+
+    if max_timestamp.is_none_or(|timestamp| timestamp < cutoff) {
+        return Err(format!(
+            "父 rollout {} 尚未写到 child fork 时刻",
+            parent_path.display()
+        ));
+    }
+
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches
+            .parent_signatures
+            .insert(cache_key, signatures.clone());
+    }
+    Ok(signatures)
+}
+
+fn resolve_parent_signatures(
+    parent_id: &str,
+    cutoff: DateTime<Utc>,
+    rollout_index: &RolloutIndex,
+) -> Result<Vec<TokenUsageSignature>, String> {
+    let Some(candidates) = rollout_index.get(parent_id) else {
+        return Err(format!("找不到父 rollout: {parent_id}"));
+    };
+
+    let mut snapshots = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        snapshots.push(parent_signatures_before(candidate, cutoff)?);
+    }
+    let Some(first) = snapshots.first() else {
+        return Err(format!("找不到父 rollout: {parent_id}"));
+    };
+    if snapshots.iter().skip(1).any(|snapshot| snapshot != first) {
+        return Err(format!(
+            "父 rollout UUID {parent_id} 对应多个内容不一致的文件"
+        ));
+    }
+    Ok(first.clone())
+}
+
+fn mark_deferred(
+    file_path: &Path,
+    modified: i64,
+    size: u64,
+    reason: PendingReason,
+) -> CodexFileSyncResult {
+    let entry = PendingEntry {
+        modified,
+        size,
+        reason,
+    };
+    let should_warn = replay_caches()
+        .lock()
+        .ok()
+        .and_then(|mut caches| {
+            caches
+                .pending
+                .insert(file_path.to_path_buf(), entry.clone())
+        })
+        .as_ref()
+        != Some(&entry);
+    if should_warn {
+        let reason = match &entry.reason {
+            PendingReason::MissingParent(parent) => format!("找不到父 rollout {parent}"),
+            PendingReason::Stable(reason) | PendingReason::Retryable(reason) => reason.clone(),
+        };
+        log::warn!("[CODEX-SYNC] deferred {}: {reason}", file_path.display());
+    }
+    CodexFileSyncResult {
+        deferred: true,
+        ..CodexFileSyncResult::default()
+    }
+}
+
 /// 同步 Codex 使用数据（从 JSONL 会话日志）
 pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let codex_dir = get_codex_config_dir();
 
     let files = collect_codex_session_files(&codex_dir);
+    let rollout_index = build_rollout_index(&files);
 
     let mut result = SessionSyncResult {
         imported: 0,
         skipped: 0,
         files_scanned: files.len() as u32,
+        suspected_duplicates: 0,
+        deferred_files: 0,
         errors: vec![],
     };
 
@@ -221,13 +843,20 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
             db,
             file_path,
             *file_mtime,
+            &rollout_index,
             &mut pricing_cache,
             resume_store.as_ref(),
             &resume_hints,
         ) {
-            Ok((imported, skipped)) => {
-                result.imported += imported;
-                result.skipped += skipped;
+            Ok(file_result) => {
+                result.imported = result.imported.saturating_add(file_result.imported);
+                result.skipped = result.skipped.saturating_add(file_result.skipped);
+                result.suspected_duplicates = result
+                    .suspected_duplicates
+                    .saturating_add(file_result.suspected_duplicates);
+                if file_result.deferred {
+                    result.deferred_files = result.deferred_files.saturating_add(1);
+                }
             }
             Err(e) => {
                 let msg = format!("Codex 会话文件解析失败 {}: {e}", file_path.display());
@@ -238,11 +867,12 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         crate::services::session_usage::sync_progress::add_done(1);
     }
 
-    if result.imported > 0 {
+    if result.imported > 0 || result.deferred_files > 0 {
         log::info!(
-            "[CODEX-SYNC] 同步完成: 导入 {} 条, 跳过 {} 条, 扫描 {} 个文件",
+            "[CODEX-SYNC] 同步完成: 导入 {} 条, 跳过 {} 条, deferred {} 个, 扫描 {} 个文件",
             result.imported,
             result.skipped,
+            result.deferred_files,
             result.files_scanned
         );
     }
@@ -279,6 +909,19 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<(PathBuf, i64)> {
     files
 }
 
+fn build_rollout_index(files: &[(PathBuf, i64)]) -> RolloutIndex {
+    let mut index = RolloutIndex::new();
+    for (path, _) in files {
+        if let Some(thread_id) = thread_id_from_filename(path) {
+            index.entry(thread_id).or_default().push(path.clone());
+        }
+    }
+    for paths in index.values_mut() {
+        paths.sort();
+    }
+    index
+}
+
 /// 递归扫描目录下的 .jsonl 文件（限制最大深度），顺带记录 mtime。
 fn collect_jsonl_recursive(
     dir: &Path,
@@ -311,8 +954,9 @@ fn push_codex_file(files: &mut Vec<(PathBuf, i64)>, path: PathBuf) {
 
 /// 同步单个 Codex JSONL 文件，返回 (imported, skipped)
 ///
-/// `file_mtime` 为 walk 阶段取得的 mtime 纳秒值；>0 时直接复用避免二次 stat，
-/// 为 0 时回退到一次 metadata 读取，保留“元数据不可读即报错”语义。
+/// `_file_mtime` is the directory-walk snapshot used for ordering. The file is
+/// statted again here because deferred-file stability needs its size and the
+/// fresh mtime closes the walk-to-processing append race.
 ///
 /// `resume` 提供 sidecar 字节续传提示：Codex 的行跳过发生在解析之后（需要重放
 /// 历史事件重建累计值状态），因此提示除字节位置外还必须携带可反序列化的
@@ -320,35 +964,155 @@ fn push_codex_file(files: &mut Vec<(PathBuf, i64)>, path: PathBuf) {
 fn sync_single_codex_file(
     db: &Database,
     file_path: &Path,
-    file_mtime: i64,
+    _file_mtime: i64,
+    rollout_index: &RolloutIndex,
     pricing_cache: &mut PricingCache,
     resume: Option<&ScanCacheStore>,
     resume_hints: &HashMap<String, SyncResumeHint>,
-) -> Result<(u32, u32), AppError> {
+) -> Result<CodexFileSyncResult, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
+    let metadata = fs::metadata(file_path)
+        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+    // This fresh stat is also needed for deferred-file stability. Use its
+    // mtime instead of the directory-walk snapshot so an append between walk
+    // and processing cannot be skipped.
+    let file_modified = metadata_modified_nanos(&metadata);
+    let file_size = metadata.len();
+    let (last_modified, last_offset) = get_codex_sync_state(db, file_path)?;
+    let hint = resume_hints.get(&file_path_str).cloned();
 
-    // 检查同步状态
-    let (last_modified, last_offset) = get_sync_state(db, &file_path_str)?;
+    if file_modified <= last_modified
+        && !unchanged_jsonl_identity_is_suspicious(
+            &metadata,
+            hint.as_ref(),
+            last_modified,
+            last_offset,
+        )
+    {
+        return Ok(CodexFileSyncResult::default());
+    }
+
+    if let Ok(mut caches) = replay_caches().lock() {
+        if let Some(pending) = caches.pending.get(file_path).cloned() {
+            if pending.modified == file_modified && pending.size == file_size {
+                match &pending.reason {
+                    PendingReason::MissingParent(parent) if !rollout_index.contains_key(parent) => {
+                        return Ok(CodexFileSyncResult {
+                            deferred: true,
+                            ..CodexFileSyncResult::default()
+                        });
+                    }
+                    PendingReason::Stable(_) => {
+                        return Ok(CodexFileSyncResult {
+                            deferred: true,
+                            ..CodexFileSyncResult::default()
+                        });
+                    }
+                    PendingReason::Retryable(_) => {
+                        caches.pending.remove(file_path);
+                    }
+                    _ => {
+                        caches.pending.remove(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    let root_thread_id = match thread_id_from_filename(file_path) {
+        Some(root_thread_id) => root_thread_id,
+        None => {
+            return defer_billable_file_or_advance(
+                db,
+                file_path,
+                file_modified,
+                file_size,
+                None,
+                PendingReason::Stable("文件名缺少有效的尾部 UUID".to_string()),
+            );
+        }
+    };
+    let root_meta = match read_root_meta(file_path, Some(&root_thread_id))? {
+        Some(root_meta) => root_meta,
+        None => {
+            return defer_billable_file_or_advance(
+                db,
+                file_path,
+                file_modified,
+                file_size,
+                Some(root_thread_id),
+                PendingReason::Stable("含计费 token 但尚无 session_meta".to_string()),
+            );
+        }
+    };
+
+    let (parent_signatures, initial_replay_phase) = match root_meta.parent {
+        ParentResolution::None => (Vec::new(), ReplayPhase::Live),
+        ParentResolution::Deferred(reason) => {
+            return defer_billable_file_or_advance(
+                db,
+                file_path,
+                file_modified,
+                file_size,
+                Some(root_thread_id),
+                PendingReason::Stable(reason),
+            );
+        }
+        ParentResolution::Parent(parent_id) => {
+            let Some(cutoff) = root_meta.timestamp else {
+                return defer_billable_file_or_advance(
+                    db,
+                    file_path,
+                    file_modified,
+                    file_size,
+                    Some(root_thread_id),
+                    PendingReason::Stable(
+                        "parented rollout 的 root meta 缺少有效 timestamp".to_string(),
+                    ),
+                );
+            };
+            match resolve_parent_signatures(&parent_id, cutoff, rollout_index) {
+                Ok(signatures) => (signatures, ReplayPhase::Matching { parent_offset: 0 }),
+                Err(reason) => {
+                    let pending_reason = if rollout_index.contains_key(&parent_id) {
+                        PendingReason::Retryable(reason)
+                    } else {
+                        PendingReason::MissingParent(parent_id)
+                    };
+                    return defer_billable_file_or_advance(
+                        db,
+                        file_path,
+                        file_modified,
+                        file_size,
+                        Some(root_thread_id),
+                        pending_reason,
+                    );
+                }
+            }
+        }
+    };
+
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches.pending.remove(file_path);
+    }
 
     // 扫描阶段：文件驱动归通用驱动，解析归下面的回调；先收集待写记录，
     // 写库阶段再统一批量落库（读文件期间不持有连接锁）。
     let mut pending: Vec<PendingCodexEntry> = Vec::new();
-
-    // fix 2：续传提示取自预载 map（零 per-file 查询）；sidecar 是否可用另行传入。
-    let hint = resume_hints.get(&file_path_str).cloned();
+    let mut replay_skipped = 0u32;
 
     let outcome = scan_jsonl_incremental(
         file_path,
-        file_mtime,
+        file_modified,
         last_modified,
         last_offset,
         hint,
         resume.is_some(),
         || FileParseState {
-            session_id: None,
             current_model: "unknown".to_string(),
             prev_total: None,
             event_index: 0,
+            replay_phase: initial_replay_phase.clone(),
         },
         |state, line, is_new| {
             // 快速过滤：在 JSON 反序列化前跳过无关行
@@ -374,17 +1138,6 @@ fn sync_single_codex_file(
             };
 
             match event_type {
-                "session_meta" if state.session_id.is_none() => {
-                    let payload = value.get("payload");
-                    state.session_id = payload
-                        .and_then(|p| {
-                            p.get("session_id")
-                                .or_else(|| p.get("sessionId"))
-                                .or_else(|| p.get("id"))
-                        })
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
                 "turn_context" => {
                     if let Some(payload) = value.get("payload") {
                         // model 可能在 payload.model 或 payload.info.model
@@ -412,6 +1165,15 @@ fn sync_single_codex_file(
                         Some(i) if !i.is_null() => i,
                         _ => return, // 跳过 info 为 null 的首个事件
                     };
+                    let Some(signature) = parse_token_signature(info) else {
+                        return;
+                    };
+
+                    let replayed = consume_replay_signature(
+                        &mut state.replay_phase,
+                        &parent_signatures,
+                        &signature,
+                    );
 
                     // 提取模型（token_count 事件也可能携带 model）
                     if let Some(model) = info
@@ -458,11 +1220,20 @@ fn sync_single_codex_file(
                         ..delta
                     };
 
-                    if delta.is_zero() {
-                        return; // 跳过 task 边界的零 delta 事件
+                    if !delta.is_zero() {
+                        state.event_index = state.event_index.saturating_add(1);
                     }
 
-                    state.event_index += 1;
+                    if replayed {
+                        if is_new && !delta.is_zero() {
+                            replay_skipped = replay_skipped.saturating_add(1);
+                        }
+                        return;
+                    }
+
+                    if delta.is_zero() {
+                        return;
+                    }
 
                     // 历史行（仅无续传提示的回退路径）只重放重建状态，不产出记录
                     if !is_new {
@@ -470,9 +1241,10 @@ fn sync_single_codex_file(
                     }
 
                     // 生成唯一 request_id
-                    let session_id_str = state.session_id.as_deref().unwrap_or("unknown");
-                    let request_id =
-                        format!("codex_session:{}:{}", session_id_str, state.event_index);
+                    let request_id = format!(
+                        "{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{}",
+                        state.event_index
+                    );
 
                     // 在入队处（解析附近）就定死 created_at：缺失/非法 timestamp
                     // 回退 now()，避免两阶段写库时才取 now() 造成退化输入时间戳后移。
@@ -483,7 +1255,7 @@ fn sync_single_codex_file(
                         request_id,
                         delta,
                         model: state.current_model.clone(),
-                        session_id: state.session_id.clone(),
+                        session_id: Some(root_thread_id.clone()),
                         created_at,
                     });
                 }
@@ -494,20 +1266,86 @@ fn sync_single_codex_file(
 
     // 文件未变化（mtime 跳过）
     let Some(outcome) = outcome else {
-        return Ok((0, 0));
+        return Ok(CodexFileSyncResult::default());
     };
 
-    // 写库阶段：一个事务批量写入，超大文件每 SESSION_LOG_COMMIT_BATCH 行分段提交
-    let mut imported: u32 = 0;
-    let mut skipped: u32 = 0;
+    let mut result = CodexFileSyncResult {
+        skipped: replay_skipped,
+        ..CodexFileSyncResult::default()
+    };
+    commit_codex_entries_and_cursor(
+        db,
+        pricing_cache,
+        &pending,
+        &file_path_str,
+        outcome.file_modified,
+        outcome.line_offset,
+        &mut result,
+    )?;
 
+    // 主库进度提交成功后，把字节位置与状态机写回 sidecar（尽力而为）
+    save_resume_hint(resume, &file_path_str, &outcome);
+
+    Ok(result)
+}
+
+fn consume_replay_signature(
+    phase: &mut ReplayPhase,
+    parent: &[TokenUsageSignature],
+    signature: &TokenUsageSignature,
+) -> bool {
+    let ReplayPhase::Matching { parent_offset } = phase else {
+        return false;
+    };
+    if let Some(relative_match) = parent[*parent_offset..]
+        .iter()
+        .position(|candidate| candidate == signature)
+    {
+        *parent_offset += relative_match + 1;
+        true
+    } else {
+        *phase = ReplayPhase::Live;
+        false
+    }
+}
+
+fn defer_billable_file_or_advance(
+    db: &Database,
+    file_path: &Path,
+    file_modified: i64,
+    file_size: u64,
+    root_thread_id: Option<String>,
+    reason: PendingReason,
+) -> Result<CodexFileSyncResult, AppError> {
+    let parsed = parse_codex_file(file_path, root_thread_id)?;
+    if parsed.has_billable_tokens {
+        return Ok(mark_deferred(file_path, file_modified, file_size, reason));
+    }
+    update_sync_state(
+        db,
+        &file_path.to_string_lossy(),
+        file_modified,
+        parsed.line_offset,
+    )?;
+    Ok(CodexFileSyncResult::default())
+}
+
+fn commit_codex_entries_and_cursor(
+    db: &Database,
+    pricing_cache: &mut PricingCache,
+    pending: &[PendingCodexEntry],
+    file_path: &str,
+    file_modified: i64,
+    line_offset: i64,
+    result: &mut CodexFileSyncResult,
+) -> Result<(), AppError> {
     let mut guard = lock_conn!(db.conn);
     let mut tx = guard
         .transaction()
         .map_err(|e| AppError::Database(format!("开启事务失败: {e}")))?;
     let mut since_commit: u32 = 0;
 
-    for entry in &pending {
+    for entry in pending {
         match insert_codex_session_entry(
             &tx,
             pricing_cache,
@@ -516,16 +1354,17 @@ fn sync_single_codex_file(
             &entry.model,
             entry.session_id.as_deref(),
             entry.created_at,
+            &mut result.suspected_duplicates,
         ) {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
+            Ok(true) => result.imported = result.imported.saturating_add(1),
+            Ok(false) => result.skipped = result.skipped.saturating_add(1),
             Err(e) => {
                 log::warn!("[CODEX-SYNC] 插入失败 ({}): {e}", entry.request_id);
-                skipped += 1;
+                result.skipped = result.skipped.saturating_add(1);
             }
         }
 
-        since_commit += 1;
+        since_commit = since_commit.saturating_add(1);
         if since_commit >= SESSION_LOG_COMMIT_BATCH {
             tx.commit()
                 .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
@@ -536,26 +1375,10 @@ fn sync_single_codex_file(
         }
     }
 
-    // 在同一事务内更新同步状态后统一提交
-    update_sync_state_conn(
-        &tx,
-        &file_path_str,
-        outcome.file_modified,
-        outcome.line_offset,
-    )?;
+    update_sync_state_conn(&tx, file_path, file_modified, line_offset)?;
     tx.commit()
         .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
-    drop(guard);
-
-    // 主库进度提交成功后，把字节位置与状态机写回 sidecar（尽力而为）
-    save_resume_hint(resume, &file_path_str, &outcome);
-
-    // 每个文件若有新插入行，只通知一次（旧实现为每行一次）
-    if imported > 0 {
-        crate::usage_events::notify_log_recorded();
-    }
-
-    Ok((imported, skipped))
+    Ok(())
 }
 
 /// 插入单条 Codex 会话记录到 proxy_request_logs
@@ -570,6 +1393,7 @@ fn insert_codex_session_entry(
     model: &str,
     session_id: Option<&str>,
     created_at: i64,
+    suspected_duplicates: &mut u32,
 ) -> Result<bool, AppError> {
     // created_at 由调用方在扫描入队处解析定死（见 resolve_codex_created_at），
     // 这里只消费固定值，不再回退 now()。
@@ -584,6 +1408,15 @@ fn insert_codex_session_entry(
     };
     if should_skip_session_insert(conn, request_id, &dedup_key)? {
         return Ok(false);
+    }
+    if has_suspected_codex_session_duplicate(conn, request_id, &dedup_key)? {
+        *suspected_duplicates = suspected_duplicates.saturating_add(1);
+        log::warn!(
+            "[CODEX-SYNC] 疑似重复会话用量: request_id={request_id}, model={model}, input={}, output={}, cache_read={}",
+            delta.input,
+            delta.output,
+            delta.cached_input
+        );
     }
 
     // 计算费用
@@ -663,118 +1496,146 @@ fn insert_codex_session_entry(
     // INSERT OR IGNORE 被并发进程抢先时未写入行，计为 skipped 而非 imported
     Ok(inserted_rows > 0)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_manager::scan_cache_store::ScanCacheStore;
+    use tempfile::tempdir;
 
-    /// 状态机持久化判别测试：sync1 后把整个历史部分覆写成等长垃圾（丢失
-    /// session_meta / turn_context / e1），再追加 e2。回退路径既无法重建
-    /// prev_total 也会因行号变化误跳新行；字节续传路径从 sidecar 恢复完整
-    /// 状态机，导入的 e2 必须是与 e1 的差值（150/30）而非累计值（250/80），
-    /// request_id 的 event_index 也必须接着上次（:2）。
-    #[test]
-    fn test_codex_resume_restores_cumulative_state() -> Result<(), AppError> {
-        let meta = r#"{"type":"session_meta","payload":{"session_id":"sess-1"}}"#;
-        let turn = r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#;
-        let e1 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}}}"#;
-        let e2 = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"cached_input_tokens":0,"output_tokens":80}}}}"#;
+    const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
+    const CHILD_A_ID: &str = "00000000-0000-4000-8000-000000000002";
+    const CHILD_B_ID: &str = "00000000-0000-4000-8000-000000000003";
 
-        let db = crate::database::Database::memory()?;
-        let store = ScanCacheStore::in_memory()?;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("rollout.jsonl");
-        let head = format!("{meta}\n{turn}\n{e1}\n");
-        fs::write(&path, &head).expect("write");
-
-        let mut cache = PricingCache::new();
-        // fix 2：提示由调用方预载后传入；测试每次调用前从 store 现取（等价生产侧
-        // 从预载 map 查找），使第二次调用能拿到第一次保存的续传提示。
-        let hints = store.load_all_sync_resume().unwrap_or_default();
-        let (imported, _) =
-            sync_single_codex_file(&db, &path, 1, &mut cache, Some(&store), &hints)?;
-        assert_eq!(imported, 1);
-
-        // 把 session_meta/turn_context 两行覆写为等长垃圾（e1 行保持原样，
-        // 尾部指纹窗口不受影响），再追加 e2。回退路径会因 meta 行损坏而把
-        // session 记为 unknown、且需重放 e1 重建状态；续传路径直接从 sidecar
-        // 恢复 sess-1/gpt-5/prev_total/event_index。
-        let prefix_len = meta.len() + 1 + turn.len() + 1;
-        let junk = "x".repeat(prefix_len - 1) + "\n";
-        fs::write(&path, format!("{junk}{e1}\n{e2}\n")).expect("rewrite");
-
-        let hints = store.load_all_sync_resume().unwrap_or_default();
-        let (imported2, skipped2) =
-            sync_single_codex_file(&db, &path, 2, &mut cache, Some(&store), &hints)?;
-        assert_eq!((imported2, skipped2), (1, 0));
-
-        let conn = lock_conn!(db.conn);
-        let (input, output): (i64, i64) = conn.query_row(
-            "SELECT input_tokens, output_tokens FROM proxy_request_logs
-             WHERE request_id = 'codex_session:sess-1:2'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!((input, output), (150, 30));
-
-        Ok(())
+    fn write_jsonl(path: &Path, values: &[serde_json::Value]) {
+        let contents = values
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(path, contents).unwrap();
     }
 
-    /// created_at 的确定性来源固化：token_count 行带显式 timestamp 时，入库
-    /// created_at 必须等于解析出的时间戳（在扫描入队处定死），与写库时刻无关。
-    /// 这是修复"两阶段延迟使退化输入时间戳后移"的可测形式——created_at 的来源是
-    /// 解析出的时间戳（now() 无法 mock，故退化输入改由下方 helper 单测覆盖）。
-    #[test]
-    fn test_codex_created_at_from_parsed_timestamp() -> Result<(), AppError> {
-        let meta = r#"{"type":"session_meta","payload":{"session_id":"sess-ts"}}"#;
-        let turn = r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#;
-        let event = r#"{"type":"event_msg","timestamp":"2026-01-02T03:04:05Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}}}"#;
-
-        let db = Database::memory()?;
-        let store = ScanCacheStore::in_memory()?;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("rollout.jsonl");
-        fs::write(&path, format!("{meta}\n{turn}\n{event}\n")).expect("write");
-
-        let mut cache = PricingCache::new();
-        let hints = store.load_all_sync_resume().unwrap_or_default();
-        let (imported, _) =
-            sync_single_codex_file(&db, &path, 1, &mut cache, Some(&store), &hints)?;
-        assert_eq!(imported, 1);
-
-        let expected = resolve_codex_created_at(Some("2026-01-02T03:04:05Z"));
-        let conn = lock_conn!(db.conn);
-        let created_at: i64 = conn.query_row(
-            "SELECT created_at FROM proxy_request_logs WHERE request_id = 'codex_session:sess-ts:1'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(created_at, expected);
-        Ok(())
+    fn rollout_path(dir: &Path, thread_id: &str) -> PathBuf {
+        dir.join(format!("rollout-2026-07-10T03-00-00-{thread_id}.jsonl"))
     }
 
-    /// 缺失/非法 timestamp 回退 now()，合法 rfc3339 走确定性解析。回退发生在入队
-    /// 处（本 helper 被扫描回调调用），写库阶段不再取 now()。
-    #[test]
-    fn test_resolve_codex_created_at_fallback_and_parse() {
-        // 合法 rfc3339 → 精确秒（00:16:45 = 1005s）
-        assert_eq!(resolve_codex_created_at(Some("1970-01-01T00:16:45Z")), 1005);
+    fn session_meta_at(
+        thread_id: &str,
+        forked_from_id: Option<&str>,
+        spawned_from_id: Option<&str>,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        let source = spawned_from_id.map_or_else(
+            || serde_json::Value::String("cli".to_string()),
+            |parent| {
+                serde_json::json!({
+                    "subagent": {
+                        "thread_spawn": { "parent_thread_id": parent }
+                    }
+                })
+            },
+        );
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "forked_from_id": forked_from_id,
+                "source": source
+            }
+        })
+    }
 
-        // 缺失 → 回退当前时刻，落在调用前后窗口内
-        let before = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let got = resolve_codex_created_at(None);
-        let after = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert!(before <= got && got <= after);
+    fn session_meta(thread_id: &str) -> serde_json::Value {
+        session_meta_at(thread_id, None, None, "2026-07-10T03:00:00Z")
+    }
 
-        // 非法字符串 → 同样回退 now()
-        assert!(resolve_codex_created_at(Some("not-a-timestamp")) >= before);
+    fn turn_context_at(timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "turn_context",
+            "payload": { "model": "gpt-5.6-sol" }
+        })
+    }
+
+    fn turn_context() -> serde_json::Value {
+        turn_context_at("2026-07-10T03:00:01Z")
+    }
+
+    fn token_count_at(input: u64, cached: u64, output: u64, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "total_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "output_tokens": output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": input + output
+                }}
+            }
+        })
+    }
+
+    fn token_count(input: u64, cached: u64, output: u64) -> serde_json::Value {
+        token_count_at(input, cached, output, "2026-07-10T03:00:02Z")
+    }
+
+    fn sync_test_file(
+        db: &Database,
+        file: &Path,
+        all_files: &[&Path],
+    ) -> Result<CodexFileSyncResult, AppError> {
+        let files = all_files
+            .iter()
+            .map(|path| {
+                let path = path.to_path_buf();
+                let modified = fs::metadata(&path)
+                    .map(|metadata| metadata_modified_nanos(&metadata))
+                    .unwrap_or(0);
+                (path, modified)
+            })
+            .collect::<Vec<_>>();
+        let file_modified = files
+            .iter()
+            .find_map(|(path, modified)| (path == file).then_some(*modified))
+            .unwrap_or(0);
+        let rollout_index = build_rollout_index(&files);
+        let mut pricing_cache = PricingCache::new();
+        sync_single_codex_file(
+            db,
+            file,
+            file_modified,
+            &rollout_index,
+            &mut pricing_cache,
+            None,
+            &HashMap::new(),
+        )
+    }
+
+    fn insert_test_codex_session_entry(
+        db: &Database,
+        request_id: &str,
+        delta: &DeltaTokens,
+        model: &str,
+        session_id: Option<&str>,
+        timestamp: Option<&str>,
+        suspected_duplicates: &mut u32,
+    ) -> Result<bool, AppError> {
+        let conn = lock_conn!(db.conn);
+        let mut pricing_cache = PricingCache::new();
+        insert_codex_session_entry(
+            &conn,
+            &mut pricing_cache,
+            request_id,
+            delta,
+            model,
+            session_id,
+            resolve_codex_created_at(timestamp),
+            suspected_duplicates,
+        )
     }
 
     #[test]
@@ -887,6 +1748,481 @@ mod tests {
     }
 
     #[test]
+    fn test_thread_spawn_parent_strips_replay_and_keeps_live_usage() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(1_000, 900, 100, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, None, Some(PARENT_ID), "2026-07-10T03:00:05Z"),
+                turn_context(),
+                token_count_at(1_000, 900, 100, "2026-07-10T03:00:06Z"),
+                token_count_at(1_300, 1_050, 150, "2026-07-10T03:00:07Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!(
+            (result.imported, result.skipped, result.deferred),
+            (1, 1, false)
+        );
+
+        let conn = lock_conn!(db.conn);
+        let usage: (i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, cache_read_tokens, output_tokens
+             FROM proxy_request_logs WHERE request_id = ?1",
+            [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:2")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(usage, (300, 150, 50));
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_resume_keeps_replay_prefix_alignment() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let resume_store = ScanCacheStore::in_memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:02Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+            ],
+        );
+
+        let files = vec![
+            (
+                parent.clone(),
+                metadata_modified_nanos(&fs::metadata(&parent).unwrap()),
+            ),
+            (
+                child.clone(),
+                metadata_modified_nanos(&fs::metadata(&child).unwrap()),
+            ),
+        ];
+        let rollout_index = build_rollout_index(&files);
+        let mut pricing_cache = PricingCache::new();
+        let first = sync_single_codex_file(
+            &db,
+            &child,
+            files[1].1,
+            &rollout_index,
+            &mut pricing_cache,
+            Some(&resume_store),
+            &HashMap::new(),
+        )?;
+        assert_eq!((first.imported, first.skipped), (0, 1));
+
+        let child_key = child.to_string_lossy().to_string();
+        let first_hint = resume_store
+            .load_sync_resume(&child_key)?
+            .expect("resume hint after first pass");
+        let first_state: FileParseState =
+            serde_json::from_str(first_hint.state.as_deref().expect("Codex parser state"))
+                .expect("deserialize Codex parser state");
+        assert!(matches!(
+            first_state.replay_phase,
+            ReplayPhase::Matching { parent_offset: 1 }
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut file = fs::OpenOptions::new().append(true).open(&child).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            token_count_at(200, 100, 20, "2026-07-10T03:00:07Z")
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            token_count_at(300, 150, 30, "2026-07-10T03:00:08Z")
+        )
+        .unwrap();
+        drop(file);
+
+        let child_mtime = metadata_modified_nanos(&fs::metadata(&child).unwrap());
+        let hints = resume_store.load_all_sync_resume()?;
+        let second = sync_single_codex_file(
+            &db,
+            &child,
+            child_mtime,
+            &rollout_index,
+            &mut pricing_cache,
+            Some(&resume_store),
+            &hints,
+        )?;
+        assert_eq!((second.imported, second.skipped), (1, 1));
+
+        let conn = lock_conn!(db.conn);
+        let usage: (i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, cache_read_tokens, output_tokens
+             FROM proxy_request_logs WHERE request_id = ?1",
+            [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:3")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(usage, (100, 50, 10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_filtered_parent_events_use_subsequence_prefix_alignment() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:02Z"),
+                token_count_at(300, 150, 30, "2026-07-10T03:00:03Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(300, 150, 30, "2026-07-10T03:00:07Z"),
+                token_count_at(450, 220, 45, "2026-07-10T03:00:08Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!((result.imported, result.skipped), (1, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_fork_imports_no_parent_usage() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:02Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+                serde_json::json!({
+                    "timestamp": "2026-07-10T03:00:08Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_settings_applied" }
+                }),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!(
+            (result.imported, result.skipped, result.deferred),
+            (0, 2, false)
+        );
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_conflicting_explicit_parents_are_deferred() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(
+                    CHILD_A_ID,
+                    Some(PARENT_ID),
+                    Some(CHILD_B_ID),
+                    "2026-07-10T03:00:05Z",
+                ),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&child])?;
+        assert!(result.deferred);
+        assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parent_future_signature_cannot_extend_replay_prefix() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:06Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!(
+            (result.imported, result.skipped, result.deferred),
+            (1, 0, false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_parent_is_deferred_and_recovered_without_child_change() -> Result<(), AppError>
+    {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, None, Some(PARENT_ID), "2026-07-10T03:00:05Z"),
+                token_count_at(900, 400, 90, "2026-07-10T03:00:06Z"),
+            ],
+        );
+
+        let deferred = sync_test_file(&db, &child, &[&child])?;
+        assert!(deferred.deferred);
+        assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
+
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        let recovered = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!((recovered.imported, recovered.deferred), (1, false));
+        Ok(())
+    }
+
+    #[test]
+    fn test_billable_file_without_meta_is_deferred_without_cursor() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(&child, &[turn_context(), token_count(100, 50, 10)]);
+
+        let result = sync_test_file(&db, &child, &[&child])?;
+        assert!(result.deferred);
+        assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_jsonl(
+            &child,
+            &[
+                turn_context(),
+                token_count(100, 50, 10),
+                session_meta_at(CHILD_A_ID, None, None, "2026-07-10T03:00:03Z"),
+            ],
+        );
+        let recovered = sync_test_file(&db, &child, &[&child])?;
+        assert_eq!((recovered.imported, recovered.deferred), (1, false));
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_billable_file_without_meta_advances_cursor() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &child,
+            &[
+                turn_context(),
+                token_count_at(0, 0, 0, "2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &child, &[&child])?;
+        assert!(!result.deferred);
+        assert_eq!(get_sync_state(&db, &child.to_string_lossy())?.1, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_subagents_use_filename_thread_ids() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child_a = rollout_path(temp.path(), CHILD_A_ID);
+        let child_b = rollout_path(temp.path(), CHILD_B_ID);
+        write_jsonl(
+            &child_a,
+            &[
+                session_meta(CHILD_A_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+            ],
+        );
+        write_jsonl(
+            &child_b,
+            &[
+                session_meta(CHILD_B_ID),
+                turn_context(),
+                token_count(200, 100, 20),
+            ],
+        );
+
+        assert_eq!(
+            sync_test_file(&db, &child_a, &[&child_a, &child_b])?.imported,
+            1
+        );
+        assert_eq!(
+            sync_test_file(&db, &child_b, &[&child_a, &child_b])?.imported,
+            1
+        );
+
+        let conn = lock_conn!(db.conn);
+        let request_ids = conn
+            .prepare(
+                "SELECT request_id FROM proxy_request_logs
+                 WHERE data_source = 'codex_session' ORDER BY request_id",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            request_ids,
+            vec![
+                format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_A_ID}:1"),
+                format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{CHILD_B_ID}:1")
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_archived_log_inherits_cursor_and_only_imports_appended_usage() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        let source = rollout_path(&sessions, PARENT_ID);
+        let archived_file = rollout_path(&archived, PARENT_ID);
+        write_jsonl(
+            &archived_file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+                token_count(200, 100, 20),
+            ],
+        );
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens,
+                    total_cost_usd, latency_ms, status_code, session_id,
+                    created_at, data_source
+                ) VALUES ('codex_session:parent:2', '_codex_session', 'codex',
+                          'gpt-5.6-sol', 'gpt-5.6-sol', 999, 99, 0, '0', 0,
+                          200, 'parent', 1, 'codex_session')",
+                [],
+            )?;
+        }
+        let source_path = source.to_string_lossy().to_string();
+        update_sync_state(&db, &source_path, 1, 3)?;
+
+        assert_eq!(
+            sync_test_file(&db, &archived_file, &[&archived_file])?.imported,
+            1
+        );
+        assert_eq!(
+            sync_test_file(&db, &archived_file, &[&archived_file])?.imported,
+            0
+        );
+
+        let conn = lock_conn!(db.conn);
+        let old_row_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE request_id = 'codex_session:parent:2'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(old_row_count, 1);
+        let usage: (i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, cache_read_tokens, output_tokens
+             FROM proxy_request_logs
+             WHERE request_id = ?1",
+            [format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_ID}:2")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(usage, (100, 50, 10));
+        drop(conn);
+        assert_eq!(get_sync_state(&db, &archived_file.to_string_lossy())?.1, 4);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_insert_codex_session_skips_matching_proxy_log() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
@@ -921,19 +2257,16 @@ mod tests {
             cached_input: 1,
             output: 2,
         };
-        let mut pricing_cache = PricingCache::new();
-        let inserted = {
-            let conn = lock_conn!(db.conn);
-            insert_codex_session_entry(
-                &conn,
-                &mut pricing_cache,
-                "codex-session-dup",
-                &delta,
-                "gpt-5.4",
-                Some("session-1"),
-                resolve_codex_created_at(Some("1970-01-01T00:16:45Z")),
-            )?
-        };
+        let mut suspected_duplicates = 0;
+        let inserted = insert_test_codex_session_entry(
+            &db,
+            "codex-session-dup",
+            &delta,
+            "gpt-5.4",
+            Some("session-1"),
+            Some("1970-01-01T00:16:45Z"),
+            &mut suspected_duplicates,
+        )?;
         assert!(!inserted);
 
         let conn = lock_conn!(db.conn);
@@ -942,6 +2275,111 @@ mod tests {
         })?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_codex_session_duplicate_is_observed_but_still_inserted() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let delta = DeltaTokens {
+            input: 10,
+            cached_input: 1,
+            output: 2,
+        };
+        let mut suspected_duplicates = 0;
+        assert!(insert_test_codex_session_entry(
+            &db,
+            "codex-session-a",
+            &delta,
+            "gpt-5.4",
+            Some("session-a"),
+            Some("1970-01-01T00:16:40Z"),
+            &mut suspected_duplicates,
+        )?);
+        assert!(insert_test_codex_session_entry(
+            &db,
+            "codex-session-b",
+            &delta,
+            "gpt-5.4",
+            Some("session-b"),
+            Some("1970-01-01T00:16:45Z"),
+            &mut suspected_duplicates,
+        )?);
+        assert_eq!(suspected_duplicates, 1);
+
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_codex_usage_only_removes_codex_rows_and_structural_cursors() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let wide_dir = temp.path();
+        let current_codex = rollout_path(&wide_dir.join("sessions"), CHILD_A_ID);
+        let legacy_codex =
+            format!("C:\\old-codex\\archived_sessions\\rollout-old-{CHILD_B_ID}.jsonl");
+        let gemini_cursor = wide_dir.join("gemini/sessions/session-123.json");
+        let claude_cursor = wide_dir.join(format!("projects/rollout-{PARENT_ID}.jsonl"));
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES
+                    ('codex-row', '_codex_session', 'codex', 'gpt', 1, 1, 0, 0, 200, 1, 'codex_session'),
+                    ('gemini-row', '_gemini_session', 'gemini', 'gemini', 1, 1, 0, 0, 200, 1, 'gemini_session');
+                 INSERT INTO usage_daily_rollups (date, app_type, provider_id, model)
+                 VALUES
+                    ('2026-07-10', 'codex', '_codex_session', 'gpt'),
+                    ('2026-07-10', 'gemini', '_gemini_session', 'gemini');",
+            )?;
+            for path in [
+                current_codex.to_string_lossy().to_string(),
+                legacy_codex,
+                gemini_cursor.to_string_lossy().to_string(),
+                claude_cursor.to_string_lossy().to_string(),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_log_sync
+                     (file_path, last_modified, last_line_offset, last_synced_at)
+                     VALUES (?1, 1, 1, 1)",
+                    [path],
+                )?;
+            }
+
+            reset_codex_usage_on_conn(&conn, wide_dir)?;
+            let codex_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let gemini_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'gemini_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let codex_rollups: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM usage_daily_rollups WHERE provider_id = '_codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let remaining_cursors: i64 =
+                conn.query_row("SELECT COUNT(*) FROM session_log_sync", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!((codex_rows, gemini_rows, codex_rollups), (0, 1, 0));
+            assert_eq!(remaining_cursors, 2);
+        }
         Ok(())
     }
 

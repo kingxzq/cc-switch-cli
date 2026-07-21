@@ -21,20 +21,22 @@ use crate::session_manager::scan_cache_store::{ScanCacheStore, SyncResumeHint};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
 const SESSION_SYNC_INTERVAL_SECS: u64 = 60;
 
 /// 同步结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSyncResult {
     pub imported: u32,
     pub skipped: u32,
     pub files_scanned: u32,
+    pub suspected_duplicates: u32,
+    pub deferred_files: u32,
     pub errors: Vec<String>,
 }
 
@@ -50,11 +52,130 @@ pub struct DataSourceSummary {
 
 impl SessionSyncResult {
     pub fn merge(&mut self, other: SessionSyncResult) {
-        self.imported += other.imported;
-        self.skipped += other.skipped;
-        self.files_scanned += other.files_scanned;
+        self.imported = self.imported.saturating_add(other.imported);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.files_scanned = self.files_scanned.saturating_add(other.files_scanned);
+        self.suspected_duplicates = self
+            .suspected_duplicates
+            .saturating_add(other.suspected_duplicates);
+        self.deferred_files = self.deferred_files.saturating_add(other.deferred_files);
         self.errors.extend(other.errors);
     }
+}
+
+/// Serializes session usage imports within this process. Callers that need a
+/// multi-step operation (backup -> reset -> reimport) hold the same lock for
+/// the complete sequence.
+pub(crate) fn session_sync_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Serializes session imports across both threads and cc-switch processes.
+///
+/// The file lock lives beside the database so the TUI, daemon, and one-shot
+/// CLI commands all rendezvous on the same inode. In-memory test databases do
+/// not have a cross-process representation and therefore use only the process
+/// mutex.
+pub(crate) struct SessionSyncGuard {
+    file: Option<File>,
+    _process: MutexGuard<'static, ()>,
+}
+
+impl Drop for SessionSyncGuard {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
+fn open_session_sync_lock(path: &Path) -> Result<File, AppError> {
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(AppError::InvalidInput(format!(
+            "会话用量同步锁不能是符号链接: {}",
+            path.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| AppError::io(path, error))?
+    };
+
+    #[cfg(not(unix))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| AppError::io(path, error))?;
+
+    let metadata = file.metadata().map_err(|error| AppError::io(path, error))?;
+    if !metadata.is_file() {
+        return Err(AppError::InvalidInput(format!(
+            "会话用量同步锁不是普通文件: {}",
+            path.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.nlink() != 1 {
+            return Err(AppError::InvalidInput(format!(
+                "会话用量同步锁不能是硬链接: {}",
+                path.display()
+            )));
+        }
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| AppError::io(path, error))?;
+    }
+
+    Ok(file)
+}
+
+/// Acquire the process-wide mutex and then the database-scoped file lock. A
+/// panic in an earlier sync must not permanently disable future imports; the
+/// protected state is committed through SQLite transactions, so recovering a
+/// poisoned mutex is safe.
+pub(crate) fn acquire_session_sync_guard(db: &Database) -> Result<SessionSyncGuard, AppError> {
+    let process = match session_sync_mutex().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("Session usage sync lock was poisoned; recovering it");
+            poisoned.into_inner()
+        }
+    };
+
+    let file = db
+        .session_usage_lock_path()
+        .map(|path| {
+            let file = open_session_sync_lock(&path)?;
+            file.lock().map_err(|error| AppError::io(&path, error))?;
+            Ok::<_, AppError>(file)
+        })
+        .transpose()?;
+
+    Ok(SessionSyncGuard {
+        file,
+        _process: process,
+    })
 }
 
 /// 从 JSONL 中解析出的 assistant 消息使用数据
@@ -169,6 +290,34 @@ pub mod sync_progress {
 }
 
 pub fn sync_all_session_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+    let _sync_guard = acquire_session_sync_guard(db)?;
+    sync_all_session_usage_unlocked(db)
+}
+
+/// Rebuild Codex session usage from its local rollout logs.
+///
+/// The shared sync guard intentionally covers the whole backup -> reset ->
+/// reimport sequence. A failed backup returns before any usage row is
+/// removed. Once reset succeeds, the Usage view must be notified even when
+/// the reimport is empty or fails so it never keeps rendering stale rows.
+pub(crate) fn rebuild_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+    let _sync_guard = acquire_session_sync_guard(db)?;
+    db.backup_database_file()?;
+    db.reset_codex_usage()?;
+
+    let result = {
+        let _progress = sync_progress::begin();
+        let _durability = db.bulk_import_durability_guard();
+        crate::services::session_usage_codex::sync_codex_usage(db)
+    };
+    crate::usage_events::notify_log_recorded();
+    result
+}
+
+/// Synchronization core for callers that already hold [`session_sync_mutex`].
+pub(crate) fn sync_all_session_usage_unlocked(
+    db: &Database,
+) -> Result<SessionSyncResult, AppError> {
     let _progress = sync_progress::begin();
     // 导入周期内本连接临时 synchronous=NORMAL（守卫恢复 FULL）：批量事务
     // 不逐次 fsync，HDD/macOS 上是首次导入的主要开销；usage 行可从源文件
@@ -178,6 +327,8 @@ pub fn sync_all_session_usage(db: &Database) -> Result<SessionSyncResult, AppErr
         imported: 0,
         skipped: 0,
         files_scanned: 0,
+        suspected_duplicates: 0,
+        deferred_files: 0,
         errors: vec![],
     };
     merge_sync_step(&mut result, "Claude", sync_claude_session_logs(db));
@@ -196,6 +347,9 @@ pub fn sync_all_session_usage(db: &Database) -> Result<SessionSyncResult, AppErr
         "OpenCode",
         crate::services::session_usage_opencode::sync_opencode_usage(db),
     );
+    if result.imported > 0 {
+        crate::usage_events::notify_log_recorded();
+    }
     Ok(result)
 }
 
@@ -225,6 +379,8 @@ pub(crate) fn run_session_usage_sync_cycle(
         imported: 0,
         skipped: 0,
         files_scanned: 0,
+        suspected_duplicates: 0,
+        deferred_files: 0,
         errors: vec![],
     };
 
@@ -272,6 +428,7 @@ pub(crate) fn spawn_periodic_session_usage_sync(
             .await;
 
         let mut interval = tokio::time::interval(Duration::from_secs(SESSION_SYNC_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
@@ -322,6 +479,8 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
             imported: 0,
             skipped: 0,
             files_scanned: 0,
+            suspected_duplicates: 0,
+            deferred_files: 0,
             errors: vec![],
         });
     }
@@ -330,6 +489,8 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
         imported: 0,
         skipped: 0,
         files_scanned: 0,
+        suspected_duplicates: 0,
+        deferred_files: 0,
         errors: vec![],
     };
 
@@ -636,11 +797,6 @@ fn sync_single_file(
     // 主库进度提交成功后，把字节位置与状态写回 sidecar（尽力而为）
     save_resume_hint(resume, &file_path_str, &outcome);
 
-    // 每个文件若有新插入行，只通知一次（旧实现为每行一次）
-    if imported > 0 {
-        crate::usage_events::notify_log_recorded();
-    }
-
     Ok((imported, skipped))
 }
 
@@ -745,6 +901,17 @@ pub(crate) fn update_sync_state_conn(
     )
     .map_err(|e| AppError::Database(format!("更新同步状态失败: {e}")))?;
     Ok(())
+}
+
+/// Update one session cursor outside an existing transaction.
+pub(crate) fn update_sync_state(
+    db: &Database,
+    file_path: &str,
+    last_modified: i64,
+    last_offset: i64,
+) -> Result<(), AppError> {
+    let conn = lock_conn!(db.conn);
+    update_sync_state_conn(&conn, file_path, last_modified, last_offset)
 }
 
 /// 插入单条会话日志到 proxy_request_logs，返回是否成功插入 (true=新插入, false=已存在)
@@ -951,6 +1118,83 @@ mod tests {
     use super::*;
     use crate::session_manager::scan_cache_store::ScanCacheStore;
 
+    #[test]
+    fn memory_database_session_guard_does_not_create_a_lock_file() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("isolated test home");
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let db = Database::memory()?;
+        assert!(db.session_usage_lock_path().is_none());
+        let _guard = acquire_session_sync_guard(&db)?;
+        assert!(!home.path().join(".cc-switch").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_sync_lock_rejects_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        fs::write(&target, b"sentinel").expect("seed target");
+
+        let symlink_path = temp.path().join("symlink.lock");
+        symlink(&target, &symlink_path).expect("create symlink");
+        assert!(open_session_sync_lock(&symlink_path).is_err());
+
+        let hardlink_path = temp.path().join("hardlink.lock");
+        fs::hard_link(&target, &hardlink_path).expect("create hardlink");
+        assert!(open_session_sync_lock(&hardlink_path).is_err());
+        assert_eq!(fs::read(&target).expect("read target"), b"sentinel");
+    }
+
+    #[test]
+    fn session_sync_guard_blocks_another_process_and_keeps_lock_inode() -> Result<(), AppError> {
+        const CHILD_ENV: &str = "CC_SWITCH_TEST_SESSION_LOCK_CHILD";
+        const TEST_NAME: &str = "services::session_usage::tests::session_sync_guard_blocks_another_process_and_keeps_lock_inode";
+
+        if let Some(home) = std::env::var_os(CHILD_ENV) {
+            let home = PathBuf::from(home);
+            let _env = crate::test_support::TestEnvGuard::isolated(&home);
+            let db = Database::init()?;
+            fs::write(home.join("attempted"), b"1").expect("write attempted marker");
+            let _guard = acquire_session_sync_guard(&db)?;
+            fs::write(home.join("acquired"), b"1").expect("write acquired marker");
+            return Ok(());
+        }
+
+        let home = tempfile::tempdir().expect("isolated test home");
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let db = Database::init()?;
+        let lock_path = db.session_usage_lock_path().expect("file database lock");
+        let guard = acquire_session_sync_guard(&db)?;
+
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args(["--exact", TEST_NAME, "--test-threads=1"])
+        .env(CHILD_ENV, home.path())
+        .spawn()
+        .expect("spawn lock contender");
+
+        let attempted = home.path().join("attempted");
+        let acquired = home.path().join("acquired");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !attempted.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(attempted.exists(), "child did not reach lock acquisition");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!acquired.exists(), "child bypassed the held file lock");
+
+        drop(guard);
+        let status = child.wait().expect("wait for lock contender");
+        assert!(status.success(), "lock contender failed: {status}");
+        assert!(acquired.exists());
+        assert!(lock_path.exists(), "lock file must keep a stable inode");
+        Ok(())
+    }
+
     /// sync_progress：begin 归零并置 active，guard drop 后 snapshot 归 None。
     /// （lib 测试内只有本用例读写这些计数器：单文件级 sync_* 测试不经过
     /// 外层循环的埋点，不会并发干扰。）
@@ -964,6 +1208,47 @@ mod tests {
             assert_eq!(sync_progress::snapshot(), Some((1, 3)));
         }
         assert!(sync_progress::snapshot().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_rebuild_backup_failure_keeps_existing_usage() -> Result<(), AppError> {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("isolated test home");
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let db = Database::init()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES
+                    ('codex-before-failed-backup', '_codex_session', 'codex', 'gpt',
+                     1, 1, 0, 0, 200, 1, 'codex_session');",
+            )?;
+        }
+
+        let backup_dir = home.path().join(".cc-switch/backups");
+        if backup_dir.exists() {
+            fs::remove_dir_all(&backup_dir).expect("remove existing backup directory");
+        }
+        let outside = home.path().join("outside-backups");
+        fs::create_dir_all(&outside).expect("create external backup target");
+        symlink(&outside, &backup_dir).expect("create backup directory symlink");
+
+        assert!(rebuild_codex_usage(&db).is_err());
+        let conn = lock_conn!(db.conn);
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE request_id = 'codex-before-failed-backup'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 1);
+        Ok(())
     }
 
     /// 字节续传判别测试：sync1 后把头部第一个换行改成空格（总字节数不变、

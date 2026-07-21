@@ -91,6 +91,7 @@ impl App {
                     ConfirmAction::ProviderApiFormatProxyNotice => Action::None,
                     ConfirmAction::CommonConfigNotice => Action::ConfirmCommonConfigNotice,
                     ConfirmAction::UsageQueryNotice => Action::ConfirmUsageQueryNotice,
+                    ConfirmAction::RebuildCodexUsage => Action::UsageRebuildCodex,
                     ConfirmAction::ManagedAuthCancelLogin => {
                         self.cancel_managed_auth_login();
                         Action::None

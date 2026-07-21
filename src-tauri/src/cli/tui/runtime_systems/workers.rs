@@ -2151,10 +2151,22 @@ fn session_usage_sync_worker_loop(
             req = next;
         }
 
-        let SessionUsageSyncReq::Run { request_id } = req;
-        let result = match crate::Database::init() {
-            Ok(db) => {
-                crate::services::session_usage::run_session_usage_sync_cycle(&db, "tui-background")
+        let msg = match crate::Database::init() {
+            Ok(db) => execute_session_usage_sync_request(&db, req),
+            Err(error) => session_usage_sync_failure(req, error.to_string()),
+        };
+        let _ = tx.send(msg);
+    }
+}
+
+fn execute_session_usage_sync_request(
+    db: &crate::Database,
+    req: SessionUsageSyncReq,
+) -> SessionUsageSyncMsg {
+    match req {
+        SessionUsageSyncReq::Run { request_id } => {
+            let result =
+                crate::services::session_usage::run_session_usage_sync_cycle(db, "tui-background")
                     .and_then(|result| {
                         if result.errors.is_empty() {
                             Ok(())
@@ -2166,12 +2178,27 @@ fn session_usage_sync_worker_loop(
                             )))
                         }
                     })
-                    .map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
-        };
+                    .map_err(|error| error.to_string());
+            SessionUsageSyncMsg::Finished { request_id, result }
+        }
+        SessionUsageSyncReq::RebuildCodex { request_id } => {
+            let result = crate::services::session_usage::rebuild_codex_usage(db)
+                .map_err(|error| error.to_string());
+            SessionUsageSyncMsg::CodexRebuilt { request_id, result }
+        }
+    }
+}
 
-        let _ = tx.send(SessionUsageSyncMsg::Finished { request_id, result });
+fn session_usage_sync_failure(req: SessionUsageSyncReq, error: String) -> SessionUsageSyncMsg {
+    match req {
+        SessionUsageSyncReq::Run { request_id } => SessionUsageSyncMsg::Finished {
+            request_id,
+            result: Err(error),
+        },
+        SessionUsageSyncReq::RebuildCodex { request_id } => SessionUsageSyncMsg::CodexRebuilt {
+            request_id,
+            result: Err(error),
+        },
     }
 }
 
@@ -3527,6 +3554,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.send(());
         }
+    }
+
+    #[test]
+    fn codex_rebuild_worker_request_resets_usage_and_returns_counts() {
+        let home = tempfile::tempdir().expect("isolated test home");
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let db = crate::Database::memory().expect("in-memory database");
+        {
+            let conn = db.conn.lock().expect("database lock");
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES
+                    ('codex-row', '_codex_session', 'codex', 'gpt', 1, 1, 0, 0, 200, 1, 'codex_session');
+                 INSERT INTO usage_daily_rollups (date, app_type, provider_id, model)
+                 VALUES ('2026-07-10', 'codex', '_codex_session', 'gpt');",
+            )
+            .expect("seed stale Codex usage");
+        }
+
+        let msg = execute_session_usage_sync_request(
+            &db,
+            SessionUsageSyncReq::RebuildCodex { request_id: 41 },
+        );
+
+        assert!(matches!(
+            msg,
+            SessionUsageSyncMsg::CodexRebuilt {
+                request_id: 41,
+                result: Ok(crate::services::session_usage::SessionSyncResult { imported: 0, .. }),
+            }
+        ));
+        let conn = db.conn.lock().expect("database lock");
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'),
+                    (SELECT COUNT(*) FROM usage_daily_rollups WHERE provider_id = '_codex_session')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query rebuilt usage");
+        assert_eq!(counts, (0, 0));
     }
 
     #[test]

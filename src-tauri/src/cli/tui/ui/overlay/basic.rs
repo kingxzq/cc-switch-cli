@@ -69,6 +69,10 @@ pub(super) fn render_confirm_overlay(
             ("Enter", texts::tui_key_cancel_login()),
             ("Esc", texts::tui_key_keep_waiting()),
         ],
+        ConfirmAction::RebuildCodexUsage => &[
+            ("Enter", texts::tui_key_backup_and_rebuild()),
+            ("Esc", texts::tui_key_cancel()),
+        ],
         _ => &[
             ("Enter", texts::tui_key_yes()),
             ("Esc", texts::tui_key_cancel()),

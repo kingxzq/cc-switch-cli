@@ -17361,6 +17361,63 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_rebuild_is_a_confirmed_usage_only_shortcut() {
+        let data = UiData::default();
+        let mut app = App::new(Some(AppType::Codex));
+        app.route = Route::Usage;
+        app.focus = Focus::Content;
+
+        let action = app.on_key(key(KeyCode::Char('R')), &data);
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(
+            &app.overlay,
+            Overlay::Confirm(ConfirmOverlay {
+                action: ConfirmAction::RebuildCodexUsage,
+                ..
+            })
+        ));
+
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(action, Action::UsageRebuildCodex));
+        assert!(matches!(&app.overlay, Overlay::None));
+
+        app.overlay = Overlay::None;
+        app.route = Route::UsageLogs;
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('R')), &data),
+            Action::None
+        ));
+
+        app.route = Route::Usage;
+        app.app_type = AppType::Claude;
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('R')), &data),
+            Action::None
+        ));
+        assert!(matches!(&app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn codex_usage_rebuild_is_help_only() {
+        let data = UiData::default();
+        let codex = App::new(Some(AppType::Codex));
+        let claude = App::new(Some(AppType::Claude));
+
+        assert!(
+            !crate::cli::tui::keymap::usage::key_bar_items(&codex, &data)
+                .iter()
+                .any(|(key, _)| *key == "R")
+        );
+        assert!(crate::cli::tui::keymap::usage::help_items(&codex, &data)
+            .iter()
+            .any(|(key, _)| *key == "R"));
+        assert!(!crate::cli::tui::keymap::usage::help_items(&claude, &data)
+            .iter()
+            .any(|(key, _)| *key == "R"));
+    }
+
+    #[test]
     fn usage_custom_range_shortcut_opens_text_input() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Usage;

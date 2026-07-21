@@ -577,6 +577,7 @@ fn sync_usage_for_provider(
     db: &Database,
     app_type: AppType,
 ) -> Result<SessionSyncResult, AppError> {
+    let _sync_guard = crate::services::session_usage::acquire_session_sync_guard(db)?;
     // 与 sync_all_session_usage 相同的导入作用域：进度可见 + 本连接（本
     // 命令独占）在导入期间临时 synchronous=NORMAL，结束恢复 FULL。
     let _progress = crate::services::session_usage::sync_progress::begin();

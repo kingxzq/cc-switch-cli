@@ -3934,6 +3934,22 @@ pub mod texts {
         }
     }
 
+    pub fn tui_key_rebuild_codex_usage() -> &'static str {
+        if is_chinese() {
+            "重建 Codex 用量"
+        } else {
+            "rebuild Codex usage"
+        }
+    }
+
+    pub fn tui_key_backup_and_rebuild() -> &'static str {
+        if is_chinese() {
+            "备份并重建"
+        } else {
+            "back up and rebuild"
+        }
+    }
+
     pub fn tui_key_start_proxy() -> &'static str {
         if is_chinese() {
             "启动代理"
@@ -7576,6 +7592,71 @@ pub mod texts {
             format!("确认从备份 '{}' 恢复？", name)
         } else {
             format!("Restore from backup '{}'?", name)
+        }
+    }
+
+    pub fn tui_confirm_rebuild_codex_usage_title() -> &'static str {
+        if is_chinese() {
+            "确认重建 Codex 用量"
+        } else {
+            "Rebuild Codex usage?"
+        }
+    }
+
+    pub fn tui_confirm_rebuild_codex_usage_message() -> &'static str {
+        if is_chinese() {
+            "将先备份数据库，再清除 Codex 会话明细与汇总，并从本地 rollout 日志重新导入。\n\n源 JSONL 已删除的历史无法恢复；缺少父 rollout 的分支会暂缓导入。"
+        } else {
+            "The database will be backed up first. Codex session details and rollups will then be cleared and re-imported from local rollout logs.\n\nHistory with deleted source JSONL cannot be recovered. Forks with a missing parent rollout will be deferred."
+        }
+    }
+
+    pub fn tui_toast_codex_usage_rebuild_running() -> &'static str {
+        if is_chinese() {
+            "Codex 用量重建已在进行中。"
+        } else {
+            "Codex usage rebuild is already running."
+        }
+    }
+
+    pub fn tui_toast_codex_usage_rebuild_unavailable() -> &'static str {
+        if is_chinese() {
+            "会话用量工作线程未运行，无法重建 Codex 用量。"
+        } else {
+            "The session usage worker is unavailable; Codex usage cannot be rebuilt."
+        }
+    }
+
+    pub fn tui_toast_codex_usage_rebuild_queued_failed(error: &str) -> String {
+        if is_chinese() {
+            format!("无法开始 Codex 用量重建：{error}")
+        } else {
+            format!("Failed to start Codex usage rebuild: {error}")
+        }
+    }
+
+    pub fn tui_toast_codex_usage_rebuilt(
+        imported: u32,
+        errors: usize,
+        suspected: u32,
+        deferred: u32,
+    ) -> String {
+        if is_chinese() {
+            format!(
+                "Codex 用量重建完成：导入 {imported} 条，错误 {errors}，疑似重复 {suspected}，暂缓文件 {deferred}"
+            )
+        } else {
+            format!(
+                "Codex usage rebuilt: {imported} imported, {errors} errors, {suspected} suspected duplicates, {deferred} deferred files"
+            )
+        }
+    }
+
+    pub fn tui_toast_codex_usage_rebuild_failed(error: &str) -> String {
+        if is_chinese() {
+            format!("Codex 用量重建失败：{error}")
+        } else {
+            format!("Codex usage rebuild failed: {error}")
         }
     }
 

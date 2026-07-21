@@ -48,6 +48,8 @@ pub fn sync_gemini_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         imported: 0,
         skipped: 0,
         files_scanned: files.len() as u32,
+        suspected_duplicates: 0,
+        deferred_files: 0,
         errors: vec![],
     };
 
@@ -274,11 +276,6 @@ fn sync_single_gemini_file(
     tx.commit()
         .map_err(|e| AppError::Database(format!("提交事务失败: {e}")))?;
     drop(guard);
-
-    // 每个文件若有新插入/更新行，只通知一次（旧实现为每行一次）
-    if imported > 0 {
-        crate::usage_events::notify_log_recorded();
-    }
 
     Ok((imported, skipped))
 }

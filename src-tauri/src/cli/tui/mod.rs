@@ -1279,6 +1279,44 @@ fn queue_background_session_usage_sync(
     }
 }
 
+fn queue_codex_usage_rebuild(
+    app: &mut App,
+    sync_req_tx: Option<&mpsc::Sender<SessionUsageSyncReq>>,
+    sync_tracker: &mut RequestTracker,
+) -> bool {
+    if app.usage.codex_usage_rebuilding() {
+        app.push_toast(
+            texts::tui_toast_codex_usage_rebuild_running().to_string(),
+            ToastKind::Info,
+        );
+        return false;
+    }
+
+    let Some(tx) = sync_req_tx else {
+        app.push_toast(
+            texts::tui_toast_codex_usage_rebuild_unavailable().to_string(),
+            ToastKind::Error,
+        );
+        return false;
+    };
+
+    // A rebuild may be queued behind an already-running background import.
+    // Replacing the active request token makes that older completion stale;
+    // the worker is single-threaded and will run the rebuild next.
+    let request_id = sync_tracker.start();
+    if let Err(error) = tx.send(SessionUsageSyncReq::RebuildCodex { request_id }) {
+        sync_tracker.cancel();
+        app.push_toast(
+            texts::tui_toast_codex_usage_rebuild_queued_failed(&error.to_string()),
+            ToastKind::Error,
+        );
+        return false;
+    }
+
+    app.usage.start_codex_usage_rebuild();
+    true
+}
+
 /// Lazily kick off the session-usage sync the first time a Usage route is shown
 /// this run. The sync scans the whole session-log history (expensive on large
 /// histories) and only feeds the Usage view, so it is deferred off startup.
@@ -1534,14 +1572,47 @@ fn handle_session_usage_sync_msg(
     usage_pricing_req_tx: Option<&mpsc::Sender<UsagePricingReq>>,
     msg: SessionUsageSyncMsg,
 ) {
-    let SessionUsageSyncMsg::Finished { request_id, result } = msg;
+    let request_id = match &msg {
+        SessionUsageSyncMsg::Finished { request_id, .. }
+        | SessionUsageSyncMsg::CodexRebuilt { request_id, .. } => *request_id,
+    };
     if !sync_tracker.finish_if_active(request_id) {
         return;
     }
-    app.usage.finish_manual_session_refresh();
 
-    if let Err(err) = result {
-        log::debug!("background session usage sync failed: {err}");
+    match msg {
+        SessionUsageSyncMsg::Finished { result, .. } => {
+            app.usage.finish_manual_session_refresh();
+            if let Err(err) = result {
+                log::debug!("background session usage sync failed: {err}");
+            }
+        }
+        SessionUsageSyncMsg::CodexRebuilt { result, .. } => {
+            app.usage.finish_codex_usage_rebuild();
+            match result {
+                Ok(result) => {
+                    let errors = result.errors.len();
+                    let kind = if errors > 0 || result.deferred_files > 0 {
+                        ToastKind::Warning
+                    } else {
+                        ToastKind::Success
+                    };
+                    app.push_toast(
+                        texts::tui_toast_codex_usage_rebuilt(
+                            result.imported,
+                            errors,
+                            result.suspected_duplicates,
+                            result.deferred_files,
+                        ),
+                        kind,
+                    );
+                }
+                Err(error) => app.push_toast(
+                    texts::tui_toast_codex_usage_rebuild_failed(&error),
+                    ToastKind::Error,
+                ),
+            }
+        }
     }
 
     // A best-effort import may commit records before another source reports an
@@ -1786,6 +1857,7 @@ fn cache_invalidation_for_action(action: &Action) -> CacheInvalidation {
         | Action::ProviderModelFetch { .. }
         | Action::UsageCustomRange { .. }
         | Action::UsageRefresh
+        | Action::UsageRebuildCodex
         | Action::UsageLogDetailRefresh { .. }
         | Action::ManagedAuthRefresh { .. }
         | Action::ManagedAuthStartLogin { .. }
@@ -2185,6 +2257,20 @@ fn handle_tui_action(
                     app.usage.request_log_page_refresh_after_aggregate();
                 }
             }
+            Ok(())
+        }
+        Action::UsageRebuildCodex => {
+            let (sync_req_tx, sync_tracker) = match session_usage_sync {
+                Some((tx, tracker)) => (Some(tx), tracker),
+                None => {
+                    app.push_toast(
+                        texts::tui_toast_codex_usage_rebuild_unavailable().to_string(),
+                        ToastKind::Error,
+                    );
+                    return Ok(());
+                }
+            };
+            let _ = queue_codex_usage_rebuild(app, sync_req_tx, sync_tracker);
             Ok(())
         }
         Action::UsageLogDetailRefresh { rowid } => {
