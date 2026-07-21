@@ -317,6 +317,13 @@ impl App {
             {
                 Some(self.handle_provider_model_fetch(selected))
             }
+            KeyCode::Char('f') if selected == ProviderAddField::ClaudeBaseUrl => {
+                let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+                    return None;
+                };
+                provider.toggle_claude_is_full_url();
+                Some(Action::None)
+            }
             KeyCode::Char(' ') | KeyCode::Enter => {
                 Some(self.handle_provider_field_activate(selected, key, data))
             }

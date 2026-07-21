@@ -191,6 +191,8 @@ impl ProviderAddFormState {
             claude_tool_search_touched: false,
             claude_disable_auto_upgrade: false,
             claude_disable_auto_upgrade_touched: false,
+            claude_is_full_url: false,
+            claude_is_full_url_touched: false,
             claude_quick_config_idx: 0,
             codex_goal_mode: false,
             codex_goal_mode_touched: false,
@@ -1961,6 +1963,11 @@ impl ProviderAddFormState {
     pub fn toggle_claude_disable_auto_upgrade(&mut self) {
         self.claude_disable_auto_upgrade = !self.claude_disable_auto_upgrade;
         self.claude_disable_auto_upgrade_touched = true;
+    }
+
+    pub fn toggle_claude_is_full_url(&mut self) {
+        self.claude_is_full_url = !self.claude_is_full_url;
+        self.claude_is_full_url_touched = true;
     }
 
     pub fn toggle_codex_fast_mode(&mut self) {

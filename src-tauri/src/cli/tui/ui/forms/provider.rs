@@ -1846,7 +1846,13 @@ pub(crate) fn provider_field_label_and_value(
             strip_trailing_colon(texts::website_url_label()).to_string()
         }
         ProviderAddField::Notes => strip_trailing_colon(texts::notes_label()).to_string(),
-        ProviderAddField::ClaudeBaseUrl => texts::tui_label_base_url().to_string(),
+        ProviderAddField::ClaudeBaseUrl => {
+            let mut label = texts::tui_label_base_url().to_string();
+            if provider.claude_is_full_url {
+                label.push_str(" (full URL)");
+            }
+            label
+        }
         ProviderAddField::ClaudeApiFormat => {
             if provider.app_type == AppType::Codex {
                 texts::tui_label_codex_upstream_format().to_string()
