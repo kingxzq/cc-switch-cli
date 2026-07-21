@@ -218,7 +218,6 @@ pub enum ProviderAddField {
     ClaudeTeammates,
     ClaudeToolSearch,
     ClaudeDisableAutoUpgrade,
-    ClaudeIsFullUrl,
     CodexOAuthAccount,
     CodexFastMode,
     CodexBaseUrl,

@@ -641,13 +641,6 @@ fn provider_field_help(app_type: AppType, field: ProviderAddField) -> HelpConten
                 "Disables Claude Code's auto-upgrade by writing env.DISABLE_AUTOUPDATER=1; turning it off removes the variable.",
             ),
         ),
-        ProviderAddField::ClaudeIsFullUrl => HelpContent::new(
-            texts::tui_label_claude_is_full_url(),
-            help_lines(
-                "When enabled, requests go to the exact URL you entered without appending /v1/chat/completions or any other path. Useful for providers that serve a non-standard endpoint path (e.g. an intranet Qianfan Lite deployment).",
-                "When enabled, requests go to the exact URL you entered without appending /v1/chat/completions or any other path. Useful for providers that serve a non-standard endpoint path (e.g. an intranet Qianfan Lite deployment).",
-            ),
-        ),
         ProviderAddField::CodexOAuthAccount => HelpContent::new(
             texts::tui_label_chatgpt_account(),
             help_lines(

@@ -55,7 +55,6 @@ pub(crate) fn add_form_key_items(
                         | ProviderAddField::ClaudeTeammates
                         | ProviderAddField::ClaudeToolSearch
                         | ProviderAddField::ClaudeDisableAutoUpgrade
-                        | ProviderAddField::ClaudeIsFullUrl
                         | ProviderAddField::CodexGoalMode
                         | ProviderAddField::CodexRemoteCompaction
                         | ProviderAddField::CodexFastMode

@@ -413,7 +413,6 @@ impl ProviderAddFormState {
                 } else if !self.is_claude_official_provider() {
                     fields.push(ProviderAddField::ClaudeBaseUrl);
                     fields.push(ProviderAddField::ClaudeApiKey);
-                    fields.push(ProviderAddField::ClaudeIsFullUrl);
                     fields.push(ProviderAddField::ClaudeAdvancedDivider);
                     fields.push(ProviderAddField::ClaudeApiFormat);
                     fields.push(ProviderAddField::ClaudeModelConfig);
@@ -615,7 +614,6 @@ impl ProviderAddFormState {
             | ProviderAddField::CodexWireApi
             | ProviderAddField::CodexRequiresOpenaiAuth
             | ProviderAddField::ClaudeApiFormat
-            | ProviderAddField::ClaudeIsFullUrl
             | ProviderAddField::ClaudeModelConfig
             | ProviderAddField::ClaudeAdvancedDivider
             | ProviderAddField::CodexAdvancedDivider
@@ -679,7 +677,6 @@ impl ProviderAddFormState {
             | ProviderAddField::CodexWireApi
             | ProviderAddField::CodexRequiresOpenaiAuth
             | ProviderAddField::ClaudeApiFormat
-            | ProviderAddField::ClaudeIsFullUrl
             | ProviderAddField::ClaudeModelConfig
             | ProviderAddField::ClaudeAdvancedDivider
             | ProviderAddField::CodexAdvancedDivider
