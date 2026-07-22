@@ -604,11 +604,17 @@ fn render_provider_inline_fields(
             provider.input(*field).map_or_else(
                 || truncated_value_cell(value, table_area.width, label_col_width, theme),
                 |input| {
-                    let (visible, x) = inline_input_window(input, value_width);
+                    let prefix = provider_full_url_value_prefix(provider, *field);
+                    let prefix_width = prefix
+                        .as_deref()
+                        .map(unicode_width::UnicodeWidthStr::width)
+                        .unwrap_or(0) as u16;
+                    let (visible, x) =
+                        inline_input_window(input, value_width.saturating_sub(prefix_width));
                     if idx == selected_idx {
-                        cursor_x = Some(x);
+                        cursor_x = Some(prefix_width.saturating_add(x));
                     }
-                    visible
+                    format!("{}{}", prefix.unwrap_or_default(), visible)
                 },
             )
         } else {
@@ -1846,13 +1852,7 @@ pub(crate) fn provider_field_label_and_value(
             strip_trailing_colon(texts::website_url_label()).to_string()
         }
         ProviderAddField::Notes => strip_trailing_colon(texts::notes_label()).to_string(),
-        ProviderAddField::ClaudeBaseUrl => {
-            let mut label = texts::tui_label_base_url().to_string();
-            if provider.claude_is_full_url {
-                label.push_str(" (full URL)");
-            }
-            label
-        }
+        ProviderAddField::ClaudeBaseUrl => texts::tui_label_base_url().to_string(),
         ProviderAddField::ClaudeApiFormat => {
             if provider.app_type == AppType::Codex {
                 texts::tui_label_codex_upstream_format().to_string()
@@ -2073,14 +2073,26 @@ pub(crate) fn provider_field_label_and_value(
             .unwrap_or_default(),
     };
 
-    (
-        label,
-        if value.is_empty() {
-            texts::tui_na().to_string()
-        } else {
-            value
-        },
-    )
+    let value = if value.is_empty() {
+        texts::tui_na().to_string()
+    } else {
+        value
+    };
+    let value = match provider_full_url_value_prefix(provider, field) {
+        Some(prefix) => format!("{prefix}{value}"),
+        None => value,
+    };
+
+    (label, value)
+}
+
+fn provider_full_url_value_prefix(
+    provider: &super::form::ProviderAddFormState,
+    field: ProviderAddField,
+) -> Option<String> {
+    provider
+        .full_url_mode_enabled_for_field(field)
+        .then(|| format!("[{}] ", texts::tui_full_url_label()))
 }
 
 pub(crate) fn codex_local_routing_field_label_and_value(

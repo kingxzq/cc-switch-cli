@@ -599,6 +599,7 @@ impl ProviderAddFormState {
             && (!self.custom_user_agent.is_blank()
                 || !self.local_proxy_header_overrides.is_empty()
                 || local_proxy_body_override.is_some());
+        let should_write_full_url = self.supports_full_url_mode() && self.is_full_url;
 
         if !should_write_common_config_meta
             && !should_write_claude_api_format
@@ -608,7 +609,7 @@ impl ProviderAddFormState {
             && !is_codex_oauth
             && !should_write_local_proxy_settings
             && !self.has_usage_script_meta()
-            && !self.claude_is_full_url
+            && !should_write_full_url
             && !provider_obj.get("meta").is_some_and(Value::is_object)
         {
             return;
@@ -665,12 +666,6 @@ impl ProviderAddFormState {
             } else {
                 meta_obj.remove("apiKeyField");
             }
-
-            if self.claude_is_full_url {
-                meta_obj.insert("isFullUrl".to_string(), json!(true));
-            } else {
-                meta_obj.remove("isFullUrl");
-            }
         }
 
         if matches!(self.app_type, AppType::Codex) {
@@ -706,6 +701,14 @@ impl ProviderAddFormState {
                 } else {
                     meta_obj.remove("promptCacheRouting");
                 }
+            }
+        }
+
+        if matches!(self.app_type, AppType::Claude | AppType::Codex) {
+            if should_write_full_url {
+                meta_obj.insert("isFullUrl".to_string(), json!(true));
+            } else {
+                meta_obj.remove("isFullUrl");
             }
         }
 
